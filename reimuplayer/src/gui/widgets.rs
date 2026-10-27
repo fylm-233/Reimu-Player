@@ -2065,8 +2065,40 @@ pub fn time_row(ui: &mut Ui, elapsed: &str, total: &str) -> Response {
 pub struct LyricRow<'a> {
     /// 左侧时间戳文本（`mm:ss`）。
     pub time_text: &'a str,
-    /// 歌词文本。
+    /// 歌词文本（**上行**）。
     pub text: &'a str,
+    /// 辅助行文本（译文或罗马音，**下行**）；无则 `None`。
+    ///
+    /// 阶段 22 起改为「上行原文、下行译文」——与桌面歌词窗完全一致。
+    /// 辅助行字号更小、透明度更低。`None` 时行高与排版跟没有这个字段时一模一样。
+    pub aux: Option<&'a str>,
+}
+
+/// 歌词正文的字号。
+///
+/// 阶段 22 由 11 提到 14：歌词区是主窗口里"最该读得清"的一块，
+/// 原字号在高分屏上几乎是注释级别。
+const LYRIC_TEXT_SIZE: f32 = 14.0;
+
+/// 辅助行（译文 / 罗马音）的字号。
+///
+/// 比正文小一号：它是「原文的注脚」，不能和原文抢视觉层级。
+const LYRIC_AUX_SIZE: f32 = 12.0;
+
+/// 辅助行与原文之间的行距。
+const LYRIC_AUX_GAP: f32 = 3.0;
+
+/// 歌词行的高度。
+///
+/// `aux_h` 是辅助行 galley 的高度，**没有辅助行时传 0**——此时公式退化成
+/// `text_h + 10`，与加辅助行之前完全一致（关闭态的像素回归基线）。
+fn lyric_row_height(aux_h: f32, text_h: f32) -> f32 {
+    let aux = if aux_h > 0.0 {
+        aux_h + LYRIC_AUX_GAP
+    } else {
+        0.0
+    };
+    (aux + text_h + 10.0).max(24.0)
 }
 
 /// 歌词面板。返回被点击行的下标（→ seek 到该行时间戳）。
@@ -2174,37 +2206,49 @@ pub fn lyric_panel(
                         let row_w = ui.available_width() - 22.0;
                         // 歌词行允许换行（HTML `.lyric-line` 无 nowrap），行高随行数增长
                         let text_w = (row_w - 52.0 - 6.0).max(60.0);
-                        let job = wrap_to(
-                            spec_job(
-                                row.text,
-                                11.0,
-                                0.01,
-                                if is_active {
-                                    fg_on(pal().blue)
-                                } else {
-                                    pal().ink
-                                },
-                                false,
-                            ),
-                            text_w,
-                            3,
-                        );
-                        let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
-                        let row_h = (galley.size().y + 10.0).max(24.0);
+                        // 三种底色（当前行 / 悬停 / 常态）各有自己的前景色；
+                        // 先按"常态"排一次拿行高——颜色不影响度量，所以悬停
+                        // 只换色重排、行高不抖。
+                        let line_color = |hovered: bool| {
+                            if is_active {
+                                fg_on(pal().blue)
+                            } else if hovered {
+                                fg_on(pal().shelf_hover)
+                            } else {
+                                pal().ink
+                            }
+                        };
+                        let layout = |ui: &Ui, text: &str, size: f32, color: Color32| {
+                            let job = wrap_to(spec_job(text, size, 0.01, color, false), text_w, 3);
+                            ui.ctx().fonts_mut(|f| f.layout_job(job))
+                        };
+                        let aux_text = row.aux.filter(|s| !s.trim().is_empty());
+                        let mut galley = layout(ui, row.text, LYRIC_TEXT_SIZE, line_color(false));
+                        let mut aux_galley = aux_text.map(|aux| {
+                            layout(
+                                ui,
+                                aux,
+                                LYRIC_AUX_SIZE,
+                                with_opacity(line_color(false), 0.72),
+                            )
+                        });
+                        let aux_h = aux_galley.as_ref().map_or(0.0, |g| g.size().y);
+                        let row_h = lyric_row_height(aux_h, galley.size().y);
                         let (rect, _) = ui.allocate_exact_size(vec2(row_w, row_h), Sense::click());
                         let response = ui.interact(rect, id.with(i), Sense::click());
                         let hovered = !is_active && response.hovered();
                         // 悬停底色是浅金光：深色主题的浅色文字会糊掉，按底色重排一次
-                        let galley = if hovered {
-                            let job = wrap_to(
-                                spec_job(row.text, 11.0, 0.01, fg_on(pal().shelf_hover), false),
-                                text_w,
-                                3,
-                            );
-                            ui.ctx().fonts_mut(|f| f.layout_job(job))
-                        } else {
-                            galley
-                        };
+                        if hovered {
+                            galley = layout(ui, row.text, LYRIC_TEXT_SIZE, line_color(true));
+                            aux_galley = aux_text.map(|aux| {
+                                layout(
+                                    ui,
+                                    aux,
+                                    LYRIC_AUX_SIZE,
+                                    with_opacity(line_color(true), 0.72),
+                                )
+                            });
+                        }
                         let painter = ui.painter();
                         if is_active {
                             painter.rect_filled(rect, radius_none(), pal().blue);
@@ -2221,7 +2265,7 @@ pub fn lyric_panel(
                             rect.left_center() + vec2(8.0, 0.0),
                             Align2::LEFT_CENTER,
                             row.time_text,
-                            8.0,
+                            9.5,
                             0.1,
                             if is_active {
                                 with_opacity(fg_on(pal().blue), 0.85)
@@ -2233,6 +2277,7 @@ pub fn lyric_panel(
                             true,
                             false,
                         );
+                        // 上行原文、下行辅助行（阶段 22 反转）
                         let text_pos = rect.left_top() + vec2(52.0, 5.0);
                         if is_active {
                             // faux-bold：双描近似 700（CJK 无粗体面）
@@ -2242,7 +2287,12 @@ pub fn lyric_panel(
                                 Color32::TRANSPARENT,
                             );
                         }
-                        painter.galley(text_pos, galley, Color32::TRANSPARENT);
+                        painter.galley(text_pos, galley.clone(), Color32::TRANSPARENT);
+                        if let Some(aux) = &aux_galley {
+                            let aux_pos =
+                                text_pos + vec2(0.0, galley.size().y + LYRIC_AUX_GAP);
+                            painter.galley(aux_pos, aux.clone(), Color32::TRANSPARENT);
+                        }
                         if response.clicked() {
                             clicked = Some(i);
                         }
@@ -2405,6 +2455,12 @@ pub struct ResRow<'a> {
     pub highlight: &'a str,
 }
 
+/// 检索结果行的固定行高。
+///
+/// 行高**必须**是常量：列表用 [`egui::ScrollArea::show_rows`] 做虚拟化，
+/// 它按固定行高反推可视区间；行高与实际绘制高度不一致会让行错位或跳动。
+pub const RES_ROW_HEIGHT: f32 = 34.0;
+
 /// 绘制检索结果行。
 pub fn res_row(ui: &mut Ui, id: egui::Id, view: &ResRow) -> RowAction {
     let width = ui.available_width();
@@ -2412,7 +2468,7 @@ pub fn res_row(ui: &mut Ui, id: egui::Id, view: &ResRow) -> RowAction {
     // 28 序号 + 26 红心 + 52 时长 + 30 ▶ + 5 个 gap
     let fixed = 28.0 + 26.0 + 52.0 + 30.0 + gap * 5.0;
     let fr = ((width - fixed) / 2.5).max(40.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(width, 34.0), Sense::click());
+    let (rect, _) = ui.allocate_exact_size(vec2(width, RES_ROW_HEIGHT), Sense::click());
     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     let response = ui.interact(rect, id, Sense::click());
     let play_rect = Rect::from_min_size(
@@ -3351,10 +3407,10 @@ mod tests {
 
     #[test]
     fn tracking_px_converts_em_to_pixels() {
-        // §1.2：window-title +0.12em @12px = 1.44px
-        assert!((tracking_px(TRACKING_WINDOW_TITLE, FONT_WINDOW_TITLE) - 1.44).abs() < 1e-6);
-        // label +0.16em @10px = 1.6px
-        assert!((tracking_px(TRACKING_LABEL, FONT_LABEL) - 1.6).abs() < 1e-6);
+        // §1.2：window-title +0.12em @13px = 1.56px
+        assert!((tracking_px(TRACKING_WINDOW_TITLE, FONT_WINDOW_TITLE) - 1.56).abs() < 1e-6);
+        // label +0.16em @11px = 1.76px
+        assert!((tracking_px(TRACKING_LABEL, FONT_LABEL) - 1.76).abs() < 1e-6);
     }
 
     #[test]
@@ -3669,6 +3725,7 @@ mod tests {
         let empty = [LyricRow {
             time_text: "",
             text: "装载后显示歌词",
+            aux: None,
         }];
         let loaded: Vec<LyricRow> = (0..6)
             .map(|i| LyricRow {
@@ -3678,6 +3735,7 @@ mod tests {
                 } else {
                     "另一行歌词"
                 },
+                aux: None,
             })
             .collect();
 
@@ -3694,6 +3752,19 @@ mod tests {
             h_empty >= body_h + 24.0 - 1.0,
             "面板高 {h_empty} 未撑满 body_h={body_h} + 头条 24"
         );
+    }
+
+    #[test]
+    fn aux_line_only_makes_the_row_taller_when_it_exists() {
+        // 关闭态是回归基线：`aux_h = 0` 必须与加辅助行之前的公式逐像素相同
+        assert_eq!(lyric_row_height(0.0, 13.0), 24.0, "13 + 10 被 24 兜住");
+        assert_eq!(lyric_row_height(0.0, 20.0), 30.0, "20 + 10，无辅助行加成");
+        // 有辅助行：多出"辅助行高 + 行距"，且严格更高
+        let with_aux = lyric_row_height(11.0, 13.0);
+        assert_eq!(with_aux, 11.0 + LYRIC_AUX_GAP + 13.0 + 10.0);
+        assert!(with_aux > lyric_row_height(0.0, 13.0));
+        // 空文本的辅助行由调用方过滤成 `aux_h = 0`，这里再兜一层
+        assert_eq!(lyric_row_height(0.0, 5.0), 24.0, "矮行也不许低于 24px");
     }
 
     // ---- 标题走马灯 -----------------------------------------------------

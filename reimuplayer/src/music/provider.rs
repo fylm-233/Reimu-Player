@@ -316,6 +316,11 @@ pub struct Playlist {
 pub struct PlaylistWindow {
     pub name: Option<String>,
     pub total: Option<u64>,
+    /// 服务端实际给出的 ID 条数（切窗口**之前**）。
+    ///
+    /// 正常应等于 `total`；小于 `total` 说明接口把 `trackIds` 截断了
+    /// （超大歌单会被截到 200 条），此时再往后翻页只会拿到空页。
+    pub available: usize,
     /// 已按 `offset`/`limit` 切片的曲目 ID；越界时为空（空页不是错误）。
     pub track_ids: Vec<String>,
 }
@@ -1524,8 +1529,30 @@ pub fn parse_playlist_detail_response(
     Ok(PlaylistWindow {
         name,
         total,
+        available: ids.len(),
         track_ids: ids[start..end].to_vec(),
     })
+}
+
+/// 解析歌单详情并返回**完整** ID 列表（不做窗口切片）。
+///
+/// 与 [`parse_playlist_detail_response`] 的唯一区别是 `track_ids`：这里返回全部
+/// ID，供 Provider 缓存后自行切页。存在的理由——`/api/v6/playlist/detail` 一次
+/// 就把整份 `trackIds` 带回来了（9826 首的歌单约 1 MB），而真正按页取的是
+/// `song_detail`；每翻一页重发一次详情纯属浪费流量与延迟。
+pub fn parse_playlist_detail_full(body: &Value) -> Result<PlaylistWindow, ProviderError> {
+    // `u32::MAX` 当 limit：`parse_playlist_detail_response` 内部用
+    // `start.saturating_add(limit).min(len)`，等价于"切到底"。
+    parse_playlist_detail_response(body, 0, u32::MAX)
+}
+
+/// 实际可取的曲目总数上界。
+///
+/// `trackCount` 是歌单真实总数，`available` 是接口这次实际给出的 ID 条数。
+/// 正常两者相等（实测 9826 首的歌单也完整）；若接口截断了 ID 列表，就以实际
+/// 条数为上界——否则"还有更多"永远为真，翻页只会反复拿到空页。
+pub(crate) fn effective_total(total: Option<u64>, available: usize) -> Option<u64> {
+    total.map(|t| t.min(available as u64))
 }
 
 /// 是否为「算法入口卡」：网易云在推荐歌单流里插入的「私人雷达」。
@@ -1847,8 +1874,9 @@ pub fn parse_lyric_response(body: &Value) -> Result<Lyrics, ProviderError> {
 
     // 逐字优先
     if let Some(yrc) = section_text("yrc") {
-        let lyrics = parse_yrc(yrc);
+        let mut lyrics = parse_yrc(yrc);
         if !lyrics.is_empty() {
+            attach_aux_tracks(&mut lyrics, body, "ytlrc", "yromalrc");
             return Ok(lyrics);
         }
         tracing::warn!("逐字歌词解析无有效行，回退普通歌词");
@@ -1856,14 +1884,56 @@ pub fn parse_lyric_response(body: &Value) -> Result<Lyrics, ProviderError> {
 
     // 普通回退
     if let Some(lrc) = section_text("lrc") {
-        let lyrics = parse_lrc(lrc);
+        let mut lyrics = parse_lrc(lrc);
         if !lyrics.is_empty() {
+            attach_aux_tracks(&mut lyrics, body, "tlyric", "romalrc");
             return Ok(lyrics);
         }
         tracing::warn!("普通歌词解析无有效行");
     }
 
     Err(ProviderError::EmptyResult)
+}
+
+/// 把翻译 / 罗马音轨挂到已解析的原文歌词上。
+///
+/// 容错原则：**辅助轨失败绝不影响原文**。原文能显示是底线，译文格式怪就只是
+/// "没有翻译"，不该让整首歌变成"无歌词"。
+///
+/// 键名随歌词类型走：逐字用 `ytlrc` / `yromalrc`，普通用 `tlyric` / `romalrc`。
+/// 两套都要认——只认一套会出现"有的歌有翻译、有的没有"。
+fn attach_aux_tracks(lyrics: &mut Lyrics, body: &Value, translation_key: &str, roman_key: &str) {
+    let section_text = |key: &str| -> Option<&str> {
+        body.get(key)
+            .and_then(|v| v.get("lyric"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+
+    // 译文轨与罗马音轨都是标准 LRC（逐字的 `ytlrc` 也是按行打轴的 LRC），
+    // 直接用 `parse_lrc` 解析，不套逐字格式
+    if let Some(text) = section_text(translation_key) {
+        let mut parsed = parse_lrc(text);
+        if parsed.is_empty() {
+            tracing::warn!("翻译轨解析无有效行（{translation_key}）");
+        } else {
+            // 译文轨一般不带 `[offset:]`，但原文可能带：不平移会让译文留在
+            // 原位，表现为"翻译比原文慢半拍"
+            crate::music::lyrics::shift_lines(&mut parsed.lines, lyrics.offset_ms);
+            lyrics.translation = parsed.lines;
+        }
+    }
+
+    if let Some(text) = section_text(roman_key) {
+        let mut parsed = parse_lrc(text);
+        if parsed.is_empty() {
+            tracing::warn!("罗马音轨解析无有效行（{roman_key}）");
+        } else {
+            crate::music::lyrics::shift_lines(&mut parsed.lines, lyrics.offset_ms);
+            lyrics.roman = parsed.lines;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2352,6 +2422,64 @@ mod tests {
         assert_eq!(w.name.as_deref(), Some("我喜欢的音乐"));
         assert_eq!(w.total, Some(5));
         assert_eq!(w.track_ids, vec!["2".to_string(), "3".to_string()]);
+    }
+
+    #[test]
+    fn playlist_window_reports_the_full_id_count_not_the_page_size() {
+        // `available` 是切窗口**之前**的条数：续取进度要靠它判断还有没有下一页，
+        // 拿窗口内的条数（2）当总数会立刻以为到底了。
+        let body = json!({
+            "playlist": {
+                "name": "大歌单", "trackCount": 5,
+                "trackIds": [ {"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}, {"id": 5} ]
+            }
+        });
+        let w = parse_playlist_detail_response(&body, 1, 2).unwrap();
+        assert_eq!(w.available, 5, "available 必须是服务端给出的全量条数");
+        assert_eq!(w.track_ids.len(), 2);
+    }
+
+    #[test]
+    fn playlist_window_available_tracks_a_truncated_id_list() {
+        // 接口把 trackIds 截断（trackCount 远大于实际条数）时，
+        // `available` 要如实反映"只能拿到这么多"，否则上层会无限翻空页。
+        let body = json!({
+            "playlist": {
+                "name": "被截断", "trackCount": 2000,
+                "trackIds": [ {"id": 1}, {"id": 2}, {"id": 3} ]
+            }
+        });
+        let w = parse_playlist_detail_response(&body, 0, 10).unwrap();
+        assert_eq!(w.total, Some(2000), "解析层如实上报接口给的 trackCount");
+        assert_eq!(w.available, 3, "同时报告实际可取的条数");
+        // 上层据此把"总数"压到实际可取条数，才不会无限翻空页
+        assert_eq!(effective_total(w.total, w.available), Some(3));
+    }
+
+    #[test]
+    fn effective_total_keeps_the_real_count_when_ids_are_complete() {
+        assert_eq!(effective_total(Some(9826), 9826), Some(9826));
+        assert_eq!(effective_total(None, 50), None, "缺失总数不编造");
+    }
+
+    #[test]
+    fn full_parse_returns_every_id_so_the_provider_can_cache_them() {
+        // Provider 缓存要的是**整份** trackIds（续取时自己切页），
+        // 不是"第一页"。用 limit=2 的分页解析做对照，确认两者语义不同。
+        let body = json!({
+            "playlist": {
+                "name": "大歌单", "trackCount": 4,
+                "trackIds": [ {"id": 1}, {"id": 2}, {"id": 3}, {"id": 4} ]
+            }
+        });
+        let full = parse_playlist_detail_full(&body).unwrap();
+        assert_eq!(full.track_ids.len(), 4, "全量解析不切窗口");
+        assert_eq!(full.available, 4);
+        assert_eq!(full.total, Some(4));
+
+        let page = parse_playlist_detail_response(&body, 0, 2).unwrap();
+        assert_eq!(page.track_ids.len(), 2, "分页解析仍然只切一页");
+        assert_eq!(page.available, 4, "两种解析的 available 一致");
     }
 
     #[test]
@@ -2981,6 +3109,78 @@ mod tests {
         let body = json!({ "lrc": { "lyric": "[00:01.00]普通行" } });
         let lyrics = parse_lyric_response(&body).unwrap();
         assert_eq!(lyrics.kind, LyricKind::Plain);
+    }
+
+    #[test]
+    fn translation_and_roman_are_attached_to_plain_lyrics() {
+        // 这就是"歌词翻译缺失"的根因所在：以前只读 lrc/yrc，tlyric/romalrc
+        // 从来没被读过，接口给了也白给。
+        let body = json!({
+            "lrc": { "lyric": "[00:01.00]ありがとう\n[00:02.00]さようなら" },
+            "tlyric": { "lyric": "[00:01.00]谢谢\n[00:02.00]再见" },
+            "romalrc": { "lyric": "[00:01.00]arigatou\n[00:02.00]sayounara" }
+        });
+        let lyrics = parse_lyric_response(&body).unwrap();
+        assert_eq!(lyrics.lines.len(), 2);
+        assert_eq!(lyrics.translation_for(0), Some("谢谢"));
+        assert_eq!(lyrics.translation_for(1), Some("再见"));
+        assert_eq!(lyrics.roman_for(0), Some("arigatou"));
+        assert_eq!(lyrics.roman_for(1), Some("sayounara"));
+    }
+
+    #[test]
+    fn word_by_word_lyrics_use_the_y_prefixed_aux_tracks() {
+        // 逐字歌词的翻译/罗马音在 `ytlrc` / `yromalrc` 里，键名不同
+        let body = json!({
+            "yrc": { "lyric": "[1000,2000](1000,500,0)あ(1500,500,0)り" },
+            "ytlrc": { "lyric": "[00:01.00]谢" },
+            "yromalrc": { "lyric": "[00:01.00]a" }
+        });
+        let lyrics = parse_lyric_response(&body).unwrap();
+        assert_eq!(lyrics.kind, LyricKind::WordByWord);
+        assert_eq!(lyrics.translation_for(0), Some("谢"));
+        assert_eq!(lyrics.roman_for(0), Some("a"));
+    }
+
+    #[test]
+    fn a_shorter_translation_track_still_aligns_by_timestamp() {
+        // 实测最常见的形态：间奏那几行没有译文。若按下标对齐，从第 2 行起
+        // 全部错位（第 2 行会拿到第 3 行的译文）。
+        let body = json!({
+            "lrc": { "lyric": "[00:01.00]A\n[00:10.00]B\n[00:20.00]C" },
+            "tlyric": { "lyric": "[00:01.00]甲\n[00:20.00]丙" }
+        });
+        let lyrics = parse_lyric_response(&body).unwrap();
+        assert_eq!(lyrics.translation_for(0), Some("甲"));
+        assert_eq!(lyrics.translation_for(1), None, "中间那行没有译文就是没有");
+        assert_eq!(lyrics.translation_for(2), Some("丙"), "不能把丙错配给第 2 行");
+    }
+
+    #[test]
+    fn a_broken_translation_never_breaks_the_original_lyrics() {
+        // 原文能显示是底线：译文格式坏掉只应导致"没有翻译"
+        let body = json!({
+            "lrc": { "lyric": "[00:01.00]原文" },
+            "tlyric": { "lyric": "这不是歌词" }
+        });
+        let lyrics = parse_lyric_response(&body).unwrap();
+        assert_eq!(lyrics.lines.len(), 1);
+        assert_eq!(lyrics.lines[0].text, "原文");
+        assert!(lyrics.translation.is_empty());
+        assert_eq!(lyrics.translation_for(0), None);
+    }
+
+    #[test]
+    fn translation_follows_the_original_offset() {
+        // 原文带 [offset:] 而译文轨没有：不平移会让译文慢半拍
+        let body = json!({
+            "lrc": { "lyric": "[offset:500]\n[00:02.00]原文" },
+            "tlyric": { "lyric": "[00:02.00]译文" }
+        });
+        let lyrics = parse_lyric_response(&body).unwrap();
+        assert_eq!(lyrics.lines[0].start_ms, 1_500, "原文已按 offset 提前");
+        assert_eq!(lyrics.translation[0].start_ms, 1_500, "译文必须同步提前");
+        assert_eq!(lyrics.translation_for(0), Some("译文"));
     }
 
     #[test]

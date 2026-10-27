@@ -26,8 +26,15 @@ pub struct LyricFrame<'a> {
     pub artist: &'a str,
     /// 当前行文本；纯音乐 / 无歌词 / 尚未到第一行为 `None`。
     pub line: Option<&'a str>,
-    /// 下一行文本（供双行显示；无则 `None`）。
-    pub next: Option<&'a str>,
+    /// 当前行的辅助文本（译文或罗马音，按设置里的两个开关决定，见
+    /// [`crate::music::lyrics::Lyrics::aux_text_for`]）。
+    ///
+    /// 渲染约定是**上行原文、下行辅助**：`aux` 画在 `line` 下面一行。
+    /// 两个开关都关时为 `None`，此时渲染结果与加这个字段之前完全一致。
+    ///
+    /// 早先这里还有一个 `next`（下一行预告），阶段 22 按需求移除了：
+    /// 桌面歌词只该显示"正在唱的这句"，预告下一句反而抢注意力。
+    pub aux: Option<&'a str>,
     /// 当前行内进度 `0.0..=1.0`（逐字染色用；行未知时为 0）。
     pub line_progress: f32,
     /// 是否正在播放（暂停时实现方应停止逐字推进但保留文本）。
@@ -76,8 +83,11 @@ pub trait DesktopLyricSink: Send {
 pub struct DesktopLyricHub {
     enabled: bool,
     sink: Option<Box<dyn DesktopLyricSink>>,
-    /// 上一次推送的去重键（`title` / `line` / `playing`）。
-    last: Option<(String, Option<String>, bool)>,
+    /// 上一次推送的去重键（`title` / `line` / `aux` / `playing`）。
+    ///
+    /// `aux` 必须在键里：否则暂停时打开「歌词翻译」开关，文案变了但去重键
+    /// 没变，桌面歌词会一直停在旧的一行上，直到下次换行才更新。
+    last: Option<(String, Option<String>, Option<String>, bool)>,
 }
 
 impl DesktopLyricHub {
@@ -141,6 +151,7 @@ impl DesktopLyricHub {
         let key = (
             frame.title.to_string(),
             frame.line.map(str::to_string),
+            frame.aux.map(str::to_string),
             frame.playing,
         );
         let unchanged = self.last.as_ref() == Some(&key);
@@ -234,7 +245,7 @@ mod tests {
             title: "T",
             artist: "A",
             line,
-            next: None,
+            aux: None,
             line_progress: 0.5,
             playing,
         }
@@ -260,6 +271,20 @@ mod tests {
         assert!(hub.update(&frame(Some("同一行"), false)));
         assert!(!hub.update(&frame(Some("同一行"), false)));
         assert_eq!(presents.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn aux_change_repushes_even_when_paused() {
+        let mut hub = DesktopLyricHub::new();
+        hub.set_enabled(true);
+        let (sink, presents, _) = recorder();
+        hub.attach(sink);
+        assert!(hub.update(&frame(Some("同一行"), false)));
+        // 暂停态下打开「歌词翻译」：原文没变，但辅助行变了，必须重新推
+        let mut with_aux = frame(Some("同一行"), false);
+        with_aux.aux = Some("译文");
+        assert!(hub.update(&with_aux));
+        assert_eq!(presents.load(Ordering::SeqCst), 2);
     }
 
     #[test]

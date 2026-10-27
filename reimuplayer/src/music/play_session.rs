@@ -338,6 +338,8 @@ mod tests {
                 start_ms: ms,
                 text: text.into(),
             }],
+            translation: Vec::new(),
+            roman: Vec::new(),
             offset_ms: 0,
             dropped_lines: 0,
         }

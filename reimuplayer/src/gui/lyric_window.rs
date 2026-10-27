@@ -17,10 +17,21 @@
 //!   另加 ACID 绿——形状差异才是主判据，颜色只是加强。
 //! - **拖动**：未锁定时窗口任意位置都能拖；锁定只禁用拖动与右键菜单。
 //! - **透明度**：未锁定时右键呼出菜单，用滑杆调背景不透明度。
-//! - **0%**：背景不画任何东西（无底板、无描边、无衬底），屏幕上只剩歌词文字。
+//! - **进度条**：右键菜单里三档（白线 / 关 / 彩色），与主窗设置面板共用同一个
+//!   [`LyricControl`]。**不跟背景透明度联动**——底板拉到 0% 时它照画，
+//!   只是自动补一层暗色衬底，否则白线压在浅色壁纸上等于没画。
+//! - **0%**：背景不画任何东西（无底板、无描边、无衬底），屏幕上只剩歌词文字
+//!   与那条进度线。
 //!
 //! 窗上**只有歌词**：曲名/艺人那行辅助文字已按用户要求去掉——0% 不透明度下
 //! 它是一行极淡的白字，横在歌词上方像一条多余的白色线条。
+//!
+//! 版面是**上行译文/罗马音、下行原文**（阶段 23 已按"样式回退"退回阶段 21 的
+//! 版本；阶段 22 曾短暂改成反过来）。「下一行预告」整块功能在阶段 22 已删除，
+//! `LyricFrame` 上不再有 `next`，回退时也没有把它带回来——那是功能不是样式。
+//!
+//! 字重与版面相反：原文用 [`LINE_WEIGHT`]（Regular）、辅助行用 [`AUX_WEIGHT`]
+//! （Bold），即**阶段 23 把两边的字重对调**。
 //!
 //! 拖动**自己算屏幕坐标**（见 [`DragTracker`]），不用 `ViewportCommand::StartDrag`：
 //! 后者在 egui-winit 里有一道 `window.has_focus()` 门槛，悬浮窗天生不是焦点窗口，
@@ -88,24 +99,44 @@ const LOCK_GLYPH_SIZE: f32 = 15.0;
 /// 可能返回 `None`，等不到就按内侧档兜底。
 const LOCATE_TRIES: u32 = 60;
 
-/// 当前行的字号。
-const LINE_SIZE: f32 = 26.0;
+/// 原文那一行的字号。
+///
+/// 阶段 23 回退到阶段 21 的 26px；**阶段 24 与辅助行对调**，原文变成小字 15px。
+/// （用户原话：「把桌面歌词的上下字体大小颠倒」——上面的译文变大、下面的原文变小。）
+const LINE_SIZE: f32 = 15.0;
 
 /// 默认落位与主窗口之间的间隙（px）。
 const DOCK_GAP: f32 = 8.0;
 
-/// 下一行的字号。
-const NEXT_SIZE: f32 = 15.0;
+/// 辅助行（译文 / 罗马音）的字号。
+///
+/// 阶段 23 是 15；阶段 24 与原文对调，变成**整窗最大的一行** 26px。
+const AUX_SIZE: f32 = 26.0;
+
+/// 辅助行与当前行之间的间隙（px）。
+const AUX_GAP: f32 = 6.0;
+
+/// 原文那一行的字重。
+///
+/// 阶段 23 需求：**原文与辅助行的字重对调**——原本原文 [`Weight::Bold`]、
+/// 辅助行 [`Weight::Regular`]，现在反过来。只动字重，字号 / 颜色 / 间距 /
+/// 位置一个都没碰（字号与上下位置本身则随"样式回退"回到了阶段 21 的值）。
+const LINE_WEIGHT: widgets::Weight = widgets::Weight::Regular;
+
+/// 辅助行（译文 / 罗马音）的字重。见 [`LINE_WEIGHT`]。
+const AUX_WEIGHT: widgets::Weight = widgets::Weight::Bold;
 
 /// 一帧的自有副本（`show_viewport_deferred` 的回调要求 `'static`）。
 ///
-/// 只留**这块窗真的会画**的东西：歌词当前行 / 下一行 / 行内进度 / 是否在播。
+/// 只留**这块窗真的会画**的东西：歌词当前行 / 辅助行 / 行内进度 / 是否在播。
 /// `LyricFrame` 里的 `title` / `artist` 不拷进来——窗上那行辅助文字已删除，
 /// 拷过来只会变成没人读的死字段。
 #[derive(Clone, Debug)]
 struct OwnedFrame {
     line: Option<String>,
-    next: Option<String>,
+    /// 当前行的辅助文本（译文 / 罗马音），画在 `line` **上面**一行
+    /// （阶段 23 已回退到阶段 21 的「上行译文、下行原文」）。
+    aux: Option<String>,
     progress: f32,
     playing: bool,
 }
@@ -114,7 +145,7 @@ impl OwnedFrame {
     fn from_borrowed(frame: &LyricFrame<'_>) -> Self {
         Self {
             line: frame.line.map(str::to_string),
-            next: frame.next.map(str::to_string),
+            aux: frame.aux.map(str::to_string),
             progress: frame.line_progress.clamp(0.0, 1.0),
             playing: frame.playing,
         }
@@ -467,9 +498,20 @@ fn render_body(
     // 唯一可信的校对途径是直读它自己的 framebuffer。
     #[cfg(debug_assertions)]
     if let Some(path) = super::probe::lyric_shot_path() {
+        // "完成"以**回调真的跑到**为准：早先是请求前就置位，而子视口的
+        // `request_screenshot` 偶尔会整帧丢掉（延迟截图时实测一次也没落盘），
+        // 一丢就再没机会补拍。现在回调里置位 + 最多每 1.5s 重发一次。
         static SHOT_DONE: AtomicBool = AtomicBool::new(false);
-        if !SHOT_DONE.swap(true, Ordering::Relaxed) {
+        static LAST_REQ: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        let due = LAST_REQ
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .map_or(true, |t| t.elapsed().as_millis() > 1500);
+        if super::probe::lyric_shot_ready() && !SHOT_DONE.load(Ordering::Relaxed) && due {
+            *LAST_REQ.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(std::time::Instant::now());
             ctx.request_screenshot(move |img| {
+                SHOT_DONE.store(true, Ordering::Relaxed);
                 let mut bytes = Vec::with_capacity(img.pixels.len() * 4);
                 for px in &img.pixels {
                     bytes.extend_from_slice(&px.to_array());
@@ -632,6 +674,29 @@ fn render_body(
                 }
                 ui.label(format!("{}%", pct.round() as u8));
             });
+            // 进度条样式：与主窗设置面板共用同一个 `LyricControl`，
+            // 改哪边都一样。放在这里是因为"看得见进度条的地方才找得到它的开关"。
+            ui.add_space(6.0);
+            ui.label(pick(lang, "进度条", "PROGRESS BAR"));
+            ui.horizontal(|ui| {
+                for style in ProgressStyle::ALL {
+                    let on = control.progress() == style;
+                    if widgets::tiny_button(
+                        ui,
+                        ui.scope_id().with(("lyric-progress", style.code())),
+                        style.label(lang),
+                        on,
+                    )
+                    .on_hover_text(style.hint(lang))
+                    .clicked()
+                        && !on
+                    {
+                        control.set_progress(style);
+                        ctx.request_repaint();
+                    }
+                    ui.add_space(4.0);
+                }
+            });
         });
     }
 
@@ -640,23 +705,26 @@ fn render_body(
         Some(line) if !line.trim().is_empty() => line,
         _ => "♪",
     };
+    let aux_text = frame.aux.as_deref().filter(|s| !s.trim().is_empty());
     let line_color = if frame.playing {
         egui::Color32::WHITE
     } else {
         egui::Color32::from_white_alpha(190)
     };
     let line_job = widgets::truncate_to(
-        widgets::spec_job_weight(
-            current,
-            LINE_SIZE,
-            0.01,
-            line_color,
-            false,
-            widgets::Weight::Bold,
-        ),
+        widgets::spec_job_weight(current, LINE_SIZE, 0.01, line_color, false, LINE_WEIGHT),
         inner.width(),
     );
-    let line_y = inner.center().y - 6.0;
+    // 垂直锚点：有辅助行时**整块**（辅助行 + 间隙 + 原文）居中，没有就退回
+    // 阶段 21 的"原文居中略上提"。
+    //
+    // 阶段 24 把字号对调后，大的一行变成了**上面的**辅助行，如果继续把原文
+    // 钉在 `center - 6`，小字原文会把整块拉到窗口上沿、下面空一大片。所以这里
+    // 按"块"算：`line_y = center - 4 + (AUX_SIZE + AUX_GAP)/2`。
+    let line_y = match aux_text {
+        Some(_) => inner.center().y - 4.0 + (AUX_SIZE + AUX_GAP) * 0.5,
+        None => inner.center().y - 6.0,
+    };
     // 字影：白色歌词压在亮壁纸上时靠这层深色描边立住
     let mut shadow = line_job.clone();
     for section in &mut shadow.sections {
@@ -677,31 +745,57 @@ fn render_body(
         false,
     );
 
-    // 下一行（预告）
-    if let Some(next) = frame.next.as_deref().filter(|s| !s.trim().is_empty()) {
-        let next_job = widgets::truncate_to(
-            widgets::spec_job(
-                next,
-                NEXT_SIZE,
-                0.01,
-                egui::Color32::from_white_alpha(150),
-                false,
-            ),
+    // 辅助行（译文 / 罗马音）：**上行**——阶段 23 已回退到阶段 21 的
+    // 「上行译文、下行原文」。两个开关都关时 `aux` 为 `None`，这一整块都不画。
+    if let Some(aux) = aux_text {
+        let aux_color = if frame.playing {
+            egui::Color32::from_white_alpha(215)
+        } else {
+            egui::Color32::from_white_alpha(160)
+        };
+        let aux_job = widgets::truncate_to(
+            widgets::spec_job_weight(aux, AUX_SIZE, 0.01, aux_color, false, AUX_WEIGHT),
             inner.width(),
+        );
+        let aux_y = line_y - LINE_SIZE * 0.5 - AUX_GAP - AUX_SIZE * 0.5;
+        // 与原文同一层字影：白字压在亮壁纸上时靠它立住
+        let mut aux_shadow = aux_job.clone();
+        for section in &mut aux_shadow.sections {
+            section.format.color = egui::Color32::from_black_alpha(120);
+        }
+        widgets::paint_job(
+            ui,
+            egui::pos2(inner.center().x + 1.5, aux_y + 1.5),
+            egui::Align2::CENTER_CENTER,
+            aux_shadow,
+            false,
         );
         widgets::paint_job(
             ui,
-            egui::pos2(inner.center().x, line_y + LINE_SIZE + 6.0),
+            egui::pos2(inner.center().x, aux_y),
             egui::Align2::CENTER_CENTER,
-            next_job,
+            aux_job,
             false,
         );
     }
 
+    // 「下一行预告」已按需求移除（阶段 22）：桌面歌词只显示当前这一句
+    // 与它的译文/罗马音，不再预告下一句。
+
     // 行内进度条：样式可配（默认细白线，彩色档跟随当前主题强调色）。
-    // 0% 时按要求只留文字，进度条也一起隐藏。
-    if frame.line.is_some() && alpha > 0 {
-        paint_progress(ui, inner, frame.progress, control.progress());
+    //
+    // **不跟背景不透明度联动**（阶段 22 修）：早先这里是 `&& alpha > 0`，
+    // 于是背景一旦拉到 0%，整条进度条跟着一起消失——看起来就像"进度条功能
+    // 被删了，只剩一个没人调的接口"。背景透明度管的是**底板**，进度条属于
+    // 歌词本身，两者不该耦合。底板没了时由 `paint_progress` 补一层暗色衬底。
+    if frame.line.is_some() {
+        paint_progress(
+            ui,
+            inner,
+            frame.progress,
+            control.progress(),
+            alpha < STROKE_MIN_ALPHA,
+        );
     }
 
     // 播放中才需要连续帧（逐字进度）；暂停时 10fps 足够
@@ -729,13 +823,16 @@ fn progress_look(style: ProgressStyle) -> Option<ProgressLook> {
     match style {
         ProgressStyle::Off => None,
         ProgressStyle::Line => Some(ProgressLook {
-            track: egui::Color32::from_white_alpha(45),
+            // 阶段 24：底色（未播放那段轨道）压得更透——45 → 24，
+            // 原来那条白底在深色封面上像一道灰杠
+            track: egui::Color32::from_white_alpha(24),
             fill: egui::Color32::from_white_alpha(235),
             height: 2.0,
             radius: egui::CornerRadius::same(1),
         }),
         ProgressStyle::Acid => Some(ProgressLook {
-            track: egui::Color32::from_white_alpha(40),
+            // 同上：彩条底色 40 → 18，让黄色那条自己说话
+            track: egui::Color32::from_white_alpha(18),
             fill: pal().acid,
             height: 3.0,
             radius: egui::CornerRadius::ZERO,
@@ -744,7 +841,17 @@ fn progress_look(style: ProgressStyle) -> Option<ProgressLook> {
 }
 
 /// 行内进度条（三种样式共用同一套几何，只换颜色与高度）。
-fn paint_progress(ui: &egui::Ui, inner: egui::Rect, progress: f32, style: ProgressStyle) {
+///
+/// `bare` = 背后**没有底板**（背景不透明度 0% 或低到不画描边）。此时白色细线
+/// 压在浅色壁纸上等于没画，所以先垫一层半透明黑当衬底；有底板时照旧，
+/// 不多画任何一个像素。
+fn paint_progress(
+    ui: &egui::Ui,
+    inner: egui::Rect,
+    progress: f32,
+    style: ProgressStyle,
+    bare: bool,
+) {
     let Some(look) = progress_look(style) else {
         return;
     };
@@ -754,6 +861,14 @@ fn paint_progress(ui: &egui::Ui, inner: egui::Rect, progress: f32, style: Progre
         egui::vec2(bar_w, look.height),
     );
     let painter = ui.painter();
+    if bare {
+        // 只比轨道外扩 1px：托得住白线，又不至于变成"一条黑杠"
+        painter.rect_filled(
+            bar.expand2(egui::vec2(1.0, 1.0)),
+            look.radius,
+            egui::Color32::from_black_alpha(56),
+        );
+    }
     painter.rect_filled(bar, look.radius, look.track);
     let mut done = bar;
     done.set_width(bar.width() * progress.clamp(0.0, 1.0));
@@ -796,14 +911,14 @@ mod tests {
             title: "T",
             artist: "A",
             line: Some("line"),
-            next: Some("next"),
+            aux: Some("译文"),
             line_progress: 1.7,
             playing: true,
         };
         let owned = OwnedFrame::from_borrowed(&frame);
         assert_eq!(owned.progress, 1.0);
         assert_eq!(owned.line.as_deref(), Some("line"));
-        assert_eq!(owned.next.as_deref(), Some("next"));
+        assert_eq!(owned.aux.as_deref(), Some("译文"));
         assert!(owned.playing);
     }
 
@@ -860,12 +975,36 @@ mod tests {
         control: &LyricControl,
         shared: &Shared,
     ) -> Vec<egui::epaint::ClippedShape> {
-        let frame = OwnedFrame {
-            line: Some("line".into()),
-            next: None,
-            progress: 0.3,
-            playing: true,
-        };
+        render_shapes_with(ctx, control, shared, None)
+    }
+
+    /// 同 [`render_shapes`]，但可指定辅助行（译文 / 罗马音）。
+    fn render_shapes_with(
+        ctx: &egui::Context,
+        control: &LyricControl,
+        shared: &Shared,
+        aux: Option<&str>,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        render_frame_shapes(
+            ctx,
+            control,
+            shared,
+            &OwnedFrame {
+                line: Some("line".into()),
+                aux: aux.map(str::to_string),
+                progress: 0.3,
+                playing: true,
+            },
+        )
+    }
+
+    /// 渲染给定的整帧。
+    fn render_frame_shapes(
+        ctx: &egui::Context,
+        control: &LyricControl,
+        shared: &Shared,
+        frame: &OwnedFrame,
+    ) -> Vec<egui::epaint::ClippedShape> {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -874,11 +1013,31 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run_ui(raw, |ui| {
-            render_body(ui, &frame, control, shared, crate::i18n::Lang::Zh);
+            render_body(ui, frame, control, shared, crate::i18n::Lang::Zh);
         });
         let shapes = out.shapes.clone();
         out.drop_without_applying_deltas();
         shapes
+    }
+
+    /// 所有文字形状的包围盒（含字影那一层）。
+    fn text_rects(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Rect> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.visual_bounding_rect()),
+                egui::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for s in shapes {
+            walk(&s.shape, &mut out);
+        }
+        out
     }
 
     /// 与窗口等大的矩形数量（底板上、下描边都算）。
@@ -889,6 +1048,24 @@ mod tests {
                 egui::Shape::Rect(r) => {
                     (r.rect.width() - BODY_SIZE[0]).abs() < 1.5
                         && (r.rect.height() - BODY_SIZE[1]).abs() < 1.5
+                }
+                _ => false,
+            })
+            .count()
+    }
+
+    /// 行内进度条画了几个矩形（轨道 / 填充 / 无底板时的衬底）。
+    ///
+    /// 判据是"又扁又长、又不是整窗那么大"：进度条高 2~3px，底板 120px，
+    /// 两者形状差得远，不会互相误判。
+    fn progress_rects(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        shapes
+            .iter()
+            .filter(|s| match &s.shape {
+                egui::Shape::Rect(r) => {
+                    r.rect.height() <= 8.0
+                        && r.rect.width() > 40.0
+                        && (r.rect.width() - BODY_SIZE[0]).abs() > 1.5
                 }
                 _ => false,
             })
@@ -911,6 +1088,179 @@ mod tests {
     }
 
     #[test]
+    fn aux_line_is_drawn_above_the_original_and_stays_inside() {
+        // 阶段 23 已按"样式回退"退回阶段 21 的版面「上行译文、下行原文」：
+        // 辅助行必须比原文更靠上，且整条不许越出窗口（窗口只有 120px 高）。
+        let ctx = egui::Context::default();
+        crate::gui::theme::setup_fonts(&ctx);
+        let control = LyricControl::new();
+        let shared = Shared::default();
+        let _ = render_shapes(&ctx, &control, &shared); // 字体预热
+
+        let plain = text_rects(&render_shapes(&ctx, &control, &shared));
+        let with_aux = text_rects(&render_shapes_with(&ctx, &control, &shared, Some("译文行")));
+        assert!(
+            with_aux.len() > plain.len(),
+            "开启辅助行后必须多画一行字：{} -> {}",
+            plain.len(),
+            with_aux.len()
+        );
+
+        // 只看歌词列（窗口水平中段）：右上角那个锁定图标也是文字形状，
+        // 不过滤掉会把"谁在上面"这个判断带跑。
+        let lyric_column = |v: &[egui::Rect]| -> Vec<egui::Rect> {
+            let (lo, hi) = (BODY_SIZE[0] * 0.25, BODY_SIZE[0] * 0.75);
+            v.iter()
+                .copied()
+                .filter(|r| r.center().x > lo && r.center().x < hi)
+                .collect()
+        };
+        let top = |v: &[egui::Rect]| v.iter().map(|r| r.top()).fold(f32::INFINITY, f32::min);
+        let bottom = |v: &[egui::Rect]| {
+            v.iter()
+                .map(|r| r.bottom())
+                .fold(f32::NEG_INFINITY, f32::max)
+        };
+        let plain_col = lyric_column(&plain);
+        let aux_col = lyric_column(&with_aux);
+        assert!(
+            !plain_col.is_empty() && !aux_col.is_empty(),
+            "歌词列应至少有一行字"
+        );
+        assert!(
+            top(&aux_col) < top(&plain_col),
+            "辅助行 {} 必须高于原文 {}",
+            top(&aux_col),
+            top(&plain_col)
+        );
+
+        let window =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(BODY_SIZE[0], BODY_SIZE[1]));
+        for r in &with_aux {
+            assert!(
+                window.contains_rect(*r),
+                "文字越出歌词窗：{r:?} 不在 {window:?} 内"
+            );
+        }
+
+        // 两行同时在场是最挤的一种情形：120px 的窗口必须仍然装得下。
+        let busiest = render_frame_shapes(
+            &ctx,
+            &control,
+            &shared,
+            &OwnedFrame {
+                line: Some("line".into()),
+                aux: Some("译文行".into()),
+                progress: 0.3,
+                playing: true,
+            },
+        );
+        let col = lyric_column(&text_rects(&busiest));
+        for r in &col {
+            assert!(window.contains_rect(*r), "两行时越界：{r:?}");
+        }
+        assert!(
+            bottom(&col) <= window.bottom(),
+            "最后一行压到窗口底边：{} > {}",
+            bottom(&col),
+            window.bottom()
+        );
+    }
+
+    /// 画出来的每一段文字：`(包围盒, 字号, 字族)`。
+    ///
+    /// 字影那一层与正文同字号同字族（只换了颜色），所以每行会出现两条，
+    /// 断言用 `for` 全查即可。
+    fn text_fonts(
+        shapes: &[egui::epaint::ClippedShape],
+    ) -> Vec<(egui::Rect, f32, egui::FontFamily)> {
+        fn walk(
+            shape: &egui::Shape,
+            out: &mut Vec<(egui::Rect, f32, egui::FontFamily)>,
+        ) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    let rect = t.visual_bounding_rect();
+                    for section in &t.galley.job.sections {
+                        out.push((
+                            rect,
+                            section.format.font_id.size,
+                            section.format.font_id.family.clone(),
+                        ));
+                    }
+                }
+                egui::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for s in shapes {
+            walk(&s.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn the_original_is_regular_and_the_translation_is_bold() {
+        // 阶段 23 需求：**原文与辅助行的字重对调**（原来原文粗、辅助行细）。
+        //
+        // 断言取自**真正画出来的 galley**，不是读常量——`spec_job_weight` 把
+        // `Weight` 映射成不同的 `FontFamily`，所以字族就是字重落地后的指纹；
+        // 常量写对了但渲染没接上，这条会挂。
+        let ctx = egui::Context::default();
+        crate::gui::theme::setup_fonts(&ctx);
+        let control = LyricControl::new();
+        let shared = Shared::default();
+        let _ = render_shapes(&ctx, &control, &shared); // 字体预热
+
+        let regular = widgets::Weight::Regular.family();
+        let bold = widgets::Weight::Bold.family();
+        assert_ne!(regular, bold, "两档字重必须落在不同字族上，否则无从区分");
+
+        let fonts = text_fonts(&render_shapes_with(
+            &ctx,
+            &control,
+            &shared,
+            Some("译文行"),
+        ));
+        // 只看歌词列：右上角锁定图标是 15px，和辅助行同号，不滤掉会串档
+        let (lo, hi) = (BODY_SIZE[0] * 0.25, BODY_SIZE[0] * 0.75);
+        let in_column = |size: f32| -> Vec<egui::FontFamily> {
+            fonts
+                .iter()
+                .filter(|(rect, s, _)| {
+                    (*s - size).abs() < 0.01
+                        && rect.center().x > lo
+                        && rect.center().x < hi
+                })
+                .map(|(_, _, f)| f.clone())
+                .collect()
+        };
+
+        let line = in_column(LINE_SIZE);
+        let aux = in_column(AUX_SIZE);
+        assert!(!line.is_empty(), "没画原文（{LINE_SIZE}px）");
+        assert!(!aux.is_empty(), "没画辅助行（{AUX_SIZE}px）");
+
+        for family in &line {
+            assert_eq!(
+                *family, regular,
+                "原文 {LINE_SIZE}px 必须是常规字重（阶段 22 之前是粗体）"
+            );
+        }
+        for family in &aux {
+            assert_eq!(
+                *family, bold,
+                "辅助行 {AUX_SIZE}px 必须是粗体（阶段 22 之前是常规）"
+            );
+        }
+    }
+
+    #[test]
     fn zero_opacity_paints_no_backdrop_at_all() {
         // 需求：透明度最低时背景"完全无渲染"，只剩文字。
         let ctx = egui::Context::default();
@@ -926,6 +1276,38 @@ mod tests {
         control.set_opacity(66);
         let shapes = render_shapes(&ctx, &control, &shared);
         assert!(backdrop_rects(&shapes) >= 1, "非 0% 时必须照常绘制底板");
+    }
+
+    #[test]
+    fn progress_bar_survives_zero_backdrop_opacity() {
+        // 阶段 22 回归：背景拉到 0% 时进度条必须照画。
+        // 早先门控是 `frame.line.is_some() && alpha > 0`，用户把背景调成 0%
+        // 之后整条进度条一起消失，看起来像"这个功能只剩一个接口"。
+        let ctx = egui::Context::default();
+        crate::gui::theme::setup_fonts(&ctx);
+        let control = LyricControl::new();
+        let shared = Shared::default();
+        let _ = render_shapes(&ctx, &control, &shared); // 字体预热
+
+        // 有底板：轨道 + 填充
+        control.set_opacity(crate::gui::lyric_control::DEFAULT_OPACITY);
+        assert!(
+            progress_rects(&render_shapes(&ctx, &control, &shared)) >= 2,
+            "有底板时进度条必须画出来"
+        );
+
+        // 0% 底板：轨道 + 填充 + 一层暗色衬底（白线压在亮壁纸上要能看见）
+        control.set_opacity(0);
+        let bare = progress_rects(&render_shapes(&ctx, &control, &shared));
+        assert!(bare >= 2, "0% 背景时进度条也必须照画，实际 {bare} 个矩形");
+
+        // Off 档整条不画——这是唯一该让进度条消失的开关
+        control.set_progress(ProgressStyle::Off);
+        assert_eq!(
+            progress_rects(&render_shapes(&ctx, &control, &shared)),
+            0,
+            "Off 档必须整条不画"
+        );
     }
 
     #[test]

@@ -23,6 +23,7 @@
 pub mod app;
 pub mod bridge;
 pub mod click_through;
+pub mod clipboard;
 pub mod context_menu;
 pub mod daily_clock;
 pub mod deck_seq;
@@ -108,6 +109,21 @@ pub fn run_with_library(
             // 真正的窗口图标由 set_window_icon 从 PE 多尺寸资源里取。
             .with_icon(eframe::egui::IconData::default())
             .with_title(title),
+        // ⛔ 必须关掉 egui-winit 的剪贴板快捷键接管。
+        //
+        // 它默认开着时，`egui_winit::State::on_keyboard_input` 遇到 Ctrl+C/X/V
+        // 会走 `is_paste_command` 分支并**直接 `return`**：
+        //   - 我们没开 eframe 的 `clipboard` feature → `self.clipboard` 是空实现，
+        //     `get()` 永远 `None` → 连 `Event::Paste` 都发不出来；
+        //   - 而那个 `return` 同时**吞掉了 `Event::Key`**，于是
+        //     `gui::app::inject_paste` 里 `key_pressed(Key::V)` 永远为假。
+        // 结果就是 Ctrl+V 完全没反应（右键菜单的粘贴反而能用——它不走按键）。
+        //
+        // 置 false 之后 egui-winit 把 `Event::Key { key: V, ctrl }` 正常发出来，
+        // `inject_paste` 才能接管。代价是 Ctrl+C/X 不再产生 `Event::Copy`/`Cut`
+        // ——但那条路本来也要靠 `clipboard` feature 才有意义（现在是空实现，
+        // 复制本来就无效），所以这里没有任何净损失。
+        clipboard_shortcuts: false,
         ..Default::default()
     };
     eframe::run_native(

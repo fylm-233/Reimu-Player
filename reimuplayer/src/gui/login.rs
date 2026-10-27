@@ -459,11 +459,13 @@ fn draw_cellphone(ui: &mut Ui, state: &mut LoginUi, lang: Lang, action: &mut Log
                 true,
             ));
             ui.add_space(4.0);
-            ui.add(
+            let paste_label = pick(lang, "粘贴", "PASTE");
+            let phone_edit = ui.add(
                 egui::TextEdit::singleline(&mut state.phone)
                     .hint_text(pick(lang, "+86 手机号", "+86 phone"))
                     .desired_width(ui.available_width()),
             );
+            super::clipboard::attach_paste_menu(&phone_edit, paste_label, &mut state.phone);
             ui.add_space(12.0);
             ui.label(widgets::spec_job(
                 pick(lang, "密码", "PASSWORD"),
@@ -479,6 +481,8 @@ fn draw_cellphone(ui: &mut Ui, state: &mut LoginUi, lang: Lang, action: &mut Log
                     .hint_text(pick(lang, "网易云密码", "NetEase password"))
                     .desired_width(ui.available_width()),
             );
+            // 密码框尤其需要粘贴：`password(true)` 只是显示成圆点，内容照常可粘
+            super::clipboard::attach_paste_menu(&resp, paste_label, &mut state.password);
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.add_space(12.0);
             if widgets::text_button(
@@ -528,6 +532,12 @@ fn draw_cookie(ui: &mut Ui, state: &mut LoginUi, lang: Lang, action: &mut LoginA
                 egui::TextEdit::singleline(&mut state.cookie_input)
                     .hint_text("MUSIC_U=…; __csrf=…")
                     .desired_width(ui.available_width()),
+            );
+            // Cookie 是一条几百字符的长串，右键粘贴比手打现实得多
+            super::clipboard::attach_paste_menu(
+                &resp,
+                pick(lang, "粘贴", "PASTE"),
+                &mut state.cookie_input,
             );
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.add_space(6.0);

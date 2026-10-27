@@ -1881,6 +1881,8 @@ mod tests {
                         start_ms: 0,
                         text: "第一行".into(),
                     }],
+                    translation: Vec::new(),
+                    roman: Vec::new(),
                     offset_ms: 0,
                     dropped_lines: 0,
                 })

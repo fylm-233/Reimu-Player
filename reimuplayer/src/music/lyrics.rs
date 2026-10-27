@@ -47,11 +47,25 @@ pub struct LyricLine {
 pub struct Lyrics {
     pub kind: LyricKind,
     pub lines: Vec<LyricLine>,
+    /// 中文翻译行（接口 `tlyric` / 逐字的 `ytlrc`）；无翻译时为空。
+    ///
+    /// 与 `lines` **独立**存放，靠时间戳就近匹配，不按下标对齐——见
+    /// [`Lyrics::translation_for`]。
+    pub translation: Vec<LyricLine>,
+    /// 罗马音行（接口 `romalrc` / 逐字的 `yromalrc`）；无罗马音时为空。
+    pub roman: Vec<LyricLine>,
     /// `[offset:±ms]` 标签（毫秒，正数=歌词提前）。已在各行时间戳上应用。
     pub offset_ms: i64,
     /// 解析中丢弃的坏行数量（时间戳缺失/格式错误）。
     pub dropped_lines: usize,
 }
+
+/// 翻译 / 罗马音与原文行的时间戳容差（毫秒）。
+///
+/// 两条轨来自接口的不同字段，时间戳通常逐字对齐，但偶尔相差几十毫秒
+/// （不同版本打轴）。超过这个距离就认为"这行没有翻译"，宁可留空也不错配
+/// ——错配的翻译比没有翻译更让人困惑。
+const AUX_MATCH_TOLERANCE_MS: u64 = 800;
 
 impl Lyrics {
     /// 空歌词（无歌词/纯音乐）。
@@ -59,6 +73,8 @@ impl Lyrics {
         Self {
             kind,
             lines: Vec::new(),
+            translation: Vec::new(),
+            roman: Vec::new(),
             offset_ms: 0,
             dropped_lines: 0,
         }
@@ -67,6 +83,44 @@ impl Lyrics {
     /// 是否没有有效歌词行。
     pub fn is_empty(&self) -> bool {
         self.lines.is_empty()
+    }
+
+    /// 第 `index` 行对应的中文翻译。
+    ///
+    /// **按时间戳就近匹配，不按下标对齐**：网易云的 `tlyric` 常比 `lrc` 少几行
+    /// （纯音乐间奏、重复段不翻译），按下标对会让整首从第一个空缺起全部错位。
+    ///
+    /// 空文本一律返回 `None`——译文轨里常有空行占位，返回空串会让 UI 画出
+    /// 一行看不见的留白。
+    pub fn translation_for(&self, index: usize) -> Option<&str> {
+        let at = self.lines.get(index)?.start_ms;
+        aux_line_at(&self.translation, at)
+    }
+
+    /// 第 `index` 行对应的罗马音（语义同 [`Self::translation_for`]）。
+    pub fn roman_for(&self, index: usize) -> Option<&str> {
+        let at = self.lines.get(index)?.start_ms;
+        aux_line_at(&self.roman, at)
+    }
+
+    /// 该行要不要在 UI 上多显示一行辅助文本（译文或罗马音）。
+    ///
+    /// 按用户要求：**译文优先**——两个开关都开时上行显示译文，罗马音让位
+    /// （`translation` 为空时才用 `roman`）。原文行本身为空（纯音乐占位）时
+    /// 不显示任何辅助行，否则会出现"上面一行字、下面一片空"。
+    pub fn aux_text_for(&self, index: usize, translation: bool, roman: bool) -> Option<&str> {
+        if self.lines.get(index)?.text.trim().is_empty() {
+            return None;
+        }
+        if translation {
+            if let Some(t) = self.translation_for(index) {
+                return Some(t);
+            }
+        }
+        if roman {
+            return self.roman_for(index);
+        }
+        None
     }
 
     /// 当前播放位置应显示的歌词行下标（实际播放时钟驱动，规范 7.4）。
@@ -83,6 +137,59 @@ impl Lyrics {
             0 => None,
             n => Some(n - 1),
         }
+    }
+
+    /// 把翻译 / 罗马音整体平移 `offset_ms`（与原文行同样的 offset 语义）。
+    ///
+    /// 译文轨通常不带 `[offset:]` 标签，但原文可能带；不平移的话原文整体
+    /// 提前/延后时译文会留在原位，看起来像"翻译慢半拍"。
+    pub fn shift_aux(&mut self, offset_ms: i64) {
+        shift_lines(&mut self.translation, offset_ms);
+        shift_lines(&mut self.roman, offset_ms);
+    }
+}
+
+/// 把一组歌词行按 LRC 的 offset 语义平移（正数 = 歌词提前 = 时间戳减小）。
+///
+/// 单独抽出来给"还没挂到 [`Lyrics`] 上"的辅助轨用：译文/罗马音先按普通 LRC
+/// 解析成一个独立集合，再整体平移到原文的时间轴上。
+pub fn shift_lines(lines: &mut [LyricLine], offset_ms: i64) {
+    if offset_ms == 0 {
+        return;
+    }
+    for line in lines.iter_mut() {
+        line.start_ms = (line.start_ms as i64 - offset_ms).max(0) as u64;
+    }
+}
+
+/// 在辅助轨里找时间戳最接近 `at_ms` 的一行，且距离在容差内。
+fn aux_line_at(lines: &[LyricLine], at_ms: u64) -> Option<&str> {
+    if lines.is_empty() {
+        return None;
+    }
+    let idx = lines.partition_point(|l| l.start_ms <= at_ms);
+    let before = idx.checked_sub(1).map(|i| &lines[i]);
+    let after = lines.get(idx);
+    let pick = match (before, after) {
+        (Some(b), Some(a)) => {
+            if at_ms - b.start_ms <= a.start_ms - at_ms {
+                b
+            } else {
+                a
+            }
+        }
+        (Some(b), None) => b,
+        (None, Some(a)) => a,
+        (None, None) => return None,
+    };
+    if pick.start_ms.abs_diff(at_ms) > AUX_MATCH_TOLERANCE_MS {
+        return None;
+    }
+    let text = pick.text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
     }
 }
 
@@ -294,6 +401,10 @@ fn finish(kind: LyricKind, mut raw: Vec<(i64, String)>, offset_ms: i64, dropped:
                 text,
             })
             .collect(),
+        // 翻译 / 罗马音由调用方（`parse_lyric_response`）另行解析后填入：
+        // 它们来自响应的不同字段，且缺一不可地要能独立降级
+        translation: Vec::new(),
+        roman: Vec::new(),
         offset_ms,
         dropped_lines: dropped,
     }
@@ -445,5 +556,68 @@ mod tests {
     fn line_at_empty_lyrics_returns_none() {
         let lyrics = Lyrics::empty(LyricKind::Plain);
         assert_eq!(lyrics.line_at(ms(5_000)), None);
+    }
+
+    // ---- 翻译 / 罗马音 ----
+
+    fn with_aux() -> Lyrics {
+        let mut lyrics = parse_lrc("[00:01.00]原文一\n[00:05.00]原文二\n");
+        lyrics.translation = parse_lrc("[00:01.00]译文一\n[00:05.00]译文二\n").lines;
+        lyrics.roman = parse_lrc("[00:01.00]genbun ichi\n[00:05.00]genbun ni\n").lines;
+        lyrics
+    }
+
+    #[test]
+    fn translation_wins_when_both_switches_are_on() {
+        // 用户选定的 B 方案：译文优先，罗马音让位
+        let lyrics = with_aux();
+        assert_eq!(lyrics.aux_text_for(0, true, true), Some("译文一"));
+        assert_eq!(lyrics.aux_text_for(0, true, false), Some("译文一"));
+        assert_eq!(lyrics.aux_text_for(0, false, true), Some("genbun ichi"));
+    }
+
+    #[test]
+    fn both_switches_off_means_no_aux_line() {
+        let lyrics = with_aux();
+        assert_eq!(lyrics.aux_text_for(0, false, false), None);
+    }
+
+    #[test]
+    fn roman_fills_in_when_translation_is_missing_for_that_line() {
+        // 译文优先不等于"译文缺失就整行空着"：那行有罗马音就该显示
+        let mut lyrics = with_aux();
+        lyrics.translation.retain(|l| l.start_ms != 1_000);
+        assert_eq!(lyrics.aux_text_for(0, true, true), Some("genbun ichi"));
+        // 但只开译文时，没有译文就是没有
+        assert_eq!(lyrics.aux_text_for(0, true, false), None);
+    }
+
+    #[test]
+    fn empty_original_line_never_gets_an_aux_line() {
+        // 纯音乐占位行：原文是空的，上面再挂一行译文会变成"一行字悬在空白上"
+        let mut lyrics = with_aux();
+        lyrics.lines[0].text = "   ".into();
+        assert_eq!(lyrics.aux_text_for(0, true, true), None);
+    }
+
+    #[test]
+    fn aux_matching_tolerates_small_timestamp_drift_but_not_big_gaps() {
+        let mut lyrics = parse_lrc("[00:10.00]原文\n");
+        lyrics.translation = vec![LyricLine {
+            start_ms: 10_600, // 差 600ms：不同版本打轴的正常抖动
+            text: "译文".into(),
+        }];
+        assert_eq!(lyrics.translation_for(0), Some("译文"));
+
+        lyrics.translation[0].start_ms = 13_000; // 差 3s：宁可没有也不能错配
+        assert_eq!(lyrics.translation_for(0), None);
+    }
+
+    #[test]
+    fn out_of_range_index_is_none_not_a_panic() {
+        let lyrics = with_aux();
+        assert_eq!(lyrics.translation_for(99), None);
+        assert_eq!(lyrics.roman_for(99), None);
+        assert_eq!(lyrics.aux_text_for(99, true, true), None);
     }
 }

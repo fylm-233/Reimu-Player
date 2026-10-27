@@ -64,6 +64,15 @@ pub struct Prefs {
     /// 存下标而不是名字：名字是给人看的，会随文案改；下标稳定，且**只许往
     /// [`super::theme::THEMES`] 末尾追加**。越界值夹回最后一套，不 panic。
     pub theme: u8,
+    /// 歌词显示中文翻译（接口 `tlyric` / `ytlrc`）。
+    ///
+    /// 默认 `false`：翻译是**额外一行**，会改变歌词面板的行高节奏，没被要求
+    /// 之前不该擅自开启。开关打开后原文旁会多出一行译文。
+    pub lyric_translation: bool,
+    /// 歌词显示罗马音（接口 `romalrc` / `yromalrc`）。
+    ///
+    /// 两个开关都开时**译文优先**（用户选定）：罗马音只在某行没有译文时补位。
+    pub lyric_roman: bool,
 }
 
 impl Prefs {
@@ -99,6 +108,9 @@ impl Default for Prefs {
             repeat: 0,
             // 首次启动落在「博丽灵梦」；用户选过主题后以磁盘上的值为准
             theme: super::theme::DEFAULT_THEME as u8,
+            // 翻译 / 罗马音默认关闭：它们是额外的行，会改变歌词面板的节奏
+            lyric_translation: false,
+            lyric_roman: false,
         }
     }
 }
@@ -200,6 +212,21 @@ pub fn parse(raw: &str) -> Option<Prefs> {
         .and_then(|v| v.as_u64())
         .map(|v| v.min(super::theme::THEMES.len().saturating_sub(1) as u64) as u8)
         .unwrap_or(Prefs::default().theme);
+    // 歌词辅助轨开关：老文件里没有这两个键 → `false`（与首次安装一致），
+    // 不需要 `PREFS_VERSION` +1
+    let lyric_translation = value
+        .get("lyric_translation")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let lyric_roman = value
+        .get("lyric_roman")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // 阶段 24 起两个开关**互斥**（最多一个为真）。老文件里可能两个都是 true
+    // （那时语义是"译文优先、罗马音让位"）→ 归一到译文；不升 PREFS_VERSION，
+    // 只是把非法组合拉回合法。
+    let (lyric_translation, lyric_roman) =
+        super::settings::normalize_gloss(lyric_translation, lyric_roman);
     Some(Prefs {
         quality,
         lang,
@@ -211,13 +238,15 @@ pub fn parse(raw: &str) -> Option<Prefs> {
         shuffle,
         repeat,
         theme,
+        lyric_translation,
+        lyric_roman,
     })
 }
 
 /// 序列化为 JSON 文本（纯函数，可测）。
 pub fn to_json(prefs: &Prefs) -> String {
     format!(
-        "{{\n  \"version\": {},\n  \"quality\": \"{}\",\n  \"lang\": \"{}\",\n  \"tray\": {},\n  \"lyric_opacity\": {},\n  \"lyric_progress\": \"{}\",\n  \"volume\": {},\n  \"muted\": {},\n  \"shuffle\": {},\n  \"repeat\": {},\n  \"theme\": {}\n}}\n",
+        "{{\n  \"version\": {},\n  \"quality\": \"{}\",\n  \"lang\": \"{}\",\n  \"tray\": {},\n  \"lyric_opacity\": {},\n  \"lyric_progress\": \"{}\",\n  \"volume\": {},\n  \"muted\": {},\n  \"shuffle\": {},\n  \"repeat\": {},\n  \"theme\": {},\n  \"lyric_translation\": {},\n  \"lyric_roman\": {}\n}}\n",
         PREFS_VERSION,
         prefs.quality.code(),
         prefs.lang.code(),
@@ -228,7 +257,9 @@ pub fn to_json(prefs: &Prefs) -> String {
         prefs.muted,
         prefs.shuffle,
         prefs.repeat,
-        prefs.theme
+        prefs.theme,
+        prefs.lyric_translation,
+        prefs.lyric_roman
     )
 }
 
@@ -490,6 +521,16 @@ mod tests {
         assert_eq!(prefs.lyric_progress, ProgressStyle::Line);
         assert_eq!(prefs.lyric_opacity, DEFAULT_OPACITY);
         assert!(prefs.tray, "新增字段不得影响既有字段");
+    }
+
+    #[test]
+    fn both_aux_switches_on_in_an_old_file_is_normalized() {
+        // 阶段 23 及以前两个开关可以同时为真（译文优先）。升级后必须归一成互斥，
+        // 否则界面上会出现两个按钮同时点亮、却只显示译文。
+        let prefs = parse("{\"version\": 1, \"lyric_translation\": true, \"lyric_roman\": true}")
+            .unwrap();
+        assert!(prefs.lyric_translation);
+        assert!(!prefs.lyric_roman, "两个都开时必须归一成只有译文");
     }
 
     #[test]

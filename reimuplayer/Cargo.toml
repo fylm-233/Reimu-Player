@@ -147,6 +147,13 @@ windows-sys = { version = "0.59", features = [
     "Win32_Graphics_Gdi",
     # 每日推荐：GetLocalTime 取本地日历日（判断"今天"是哪天、跨天自动刷新）
     "Win32_System_SystemInformation",
+    # 输入框粘贴：OpenClipboard / GetClipboardData 读 CF_UNICODETEXT。
+    #
+    # 为什么不用 eframe 的 `clipboard` feature：那条路会引入 `arboard` 依赖，
+    # 而这里只需要"粘贴纯文本"一件事；`windows-sys` 是纯 metadata 的 feature
+    # gate，加这两个特性**不新增编译单元**。
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
 ] }
 
 # ---- 窗口图标：从 CreationContext 取 HWND（仅 Windows）----

@@ -205,6 +205,23 @@ pub(crate) fn lyric_shot_path() -> Option<String> {
     std::env::var("REIMU_PROBE_LYRIC_SHOT").ok()
 }
 
+/// `REIMU_PROBE_LYRIC_SHOT_AT=<秒>`：**仅调试构建**，把歌词窗截图推迟到启动 N 秒后。
+///
+/// 不设时仍是"歌词窗第一帧"——那是最早能拿到帧的时刻，但那时还没起播，窗上只有
+/// `♪` 占位。要拍**真实歌词行**（校对字重 / 字号这类只能看像素的结论）就必须
+/// 先点一首歌、再等歌词加载完，于是需要一个延迟。配合 `REIMU_PROBE_SETTLE`
+/// 用同一个进程同时拿到主窗帧与歌词窗帧。
+#[cfg(debug_assertions)]
+pub(crate) fn lyric_shot_ready() -> bool {
+    static START: OnceLock<Instant> = OnceLock::new();
+    let at = std::env::var("REIMU_PROBE_LYRIC_SHOT_AT")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(0.0);
+    START.get_or_init(Instant::now).elapsed().as_secs_f32() >= at
+}
+
 /// `REIMU_PROBE_LYRIC_LOCKED=1`：**仅调试构建**，启动即把桌面歌词设为锁定态。
 ///
 /// 用途：锁定后控件窗会多出一条透明度滑杆（宽度从 92 变 232），并且展示窗右上角

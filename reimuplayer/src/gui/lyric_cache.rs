@@ -87,6 +87,8 @@ mod tests {
                 start_ms: 0,
                 text: id.to_string(),
             }],
+            translation: Vec::new(),
+            roman: Vec::new(),
             offset_ms: 0,
             dropped_lines: 0,
         }

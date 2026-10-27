@@ -35,7 +35,7 @@ use crate::music::provider::{
     find_liked_playlist_id, is_algorithm_playlist_card, parse_availability_response,
     parse_cellphone_login_response, parse_featured_playlists_response,
     parse_liked_song_ids_response, parse_login_status_response, parse_lyric_response,
-    parse_playback_source, parse_playlist_detail_response, parse_qr_check_response,
+    parse_playback_source, parse_playlist_detail_full, parse_qr_check_response,
     parse_qr_key_response, parse_search_response, parse_song_array_response,
     parse_song_details_response, parse_user_playlists_response, FeaturedKind, LoginState,
     MusicProvider, PlaybackSource, Playlist, PlaylistSummary, PlaylistWindow, ProviderError,
@@ -60,8 +60,16 @@ const LYRIC_TIMEOUT: Duration = Duration::from_secs(8);
 /// 登录相关请求整体超时（二维码 key / 轮询 / 状态查询，取 8 秒）。
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// 单次请求的结果数上限（搜索 / 歌单分页共用），防止误传超大 limit。
+/// 单次请求的结果数上限（搜索 / 精选列表共用），防止误传超大 limit。
 const MAX_LIMIT: u32 = 50;
+
+/// 歌单分页的单页上限（独立于 [`MAX_LIMIT`]）。
+///
+/// 歌单动辄上千首（实测最大 9826 首），按 50 一页要翻近两百次；而
+/// `playlist_inner` 的代价是**一次 detail + 一次批量详情**，200 首详情实测
+/// 仍在 1 秒内，远低于 [`DETAIL_TIMEOUT`]。所以这里单独放宽到 200，
+/// 不动搜索/精选的 50（那些列表本来就没必要一次取太多）。
+const MAX_PLAYLIST_LIMIT: u32 = 200;
 
 /// 各类请求的整体超时配置（规范 8.1）。
 ///
@@ -98,6 +106,50 @@ impl Default for ProviderTimeouts {
     }
 }
 
+/// 歌单 ID 列表缓存容量（最近 N 张歌单）。
+///
+/// 9826 首的歌单光 ID 就约 300 KB（`String` 堆分配），缓存 4 张约 1 MB，
+/// 对桌面应用可以忽略；再多没有意义——用户不会同时翻 5 张上万首的歌单。
+const PLAYLIST_ID_CACHE: usize = 4;
+
+/// 一张歌单的完整曲目 ID 列表。
+///
+/// 详情接口一次就把整份 `trackIds` 带回来，真正按页取的是 `song_detail`。
+/// 把 ID 列表缓存下来，续取时只发一次 `song_detail`，省掉每次约 1 MB 的详情体。
+#[derive(Clone)]
+struct CachedPlaylistIds {
+    id: String,
+    name: Option<String>,
+    total: Option<u64>,
+    ids: std::sync::Arc<Vec<String>>,
+}
+
+/// 歌单 ID 列表的小容量 LRU（前端插入，尾部淘汰）。
+#[derive(Default)]
+struct PlaylistIdCache {
+    entries: std::collections::VecDeque<CachedPlaylistIds>,
+}
+
+impl PlaylistIdCache {
+    fn get(&self, id: &str) -> Option<CachedPlaylistIds> {
+        self.entries.iter().find(|e| e.id == id).cloned()
+    }
+
+    fn put(&mut self, entry: CachedPlaylistIds) {
+        self.entries.retain(|e| e.id != entry.id);
+        self.entries.push_front(entry);
+        while self.entries.len() > PLAYLIST_ID_CACHE {
+            self.entries.pop_back();
+        }
+    }
+
+    /// 登录态变化时整批作废：不同账号看到的歌单内容可能不同（私密歌单、
+    /// 曲目权限），跨账号复用会串数据。
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
 /// 网易云音乐 Provider。
 pub struct NeteaseProvider {
     client: std::sync::RwLock<ncm_api_rs::ApiClient>,
@@ -124,6 +176,8 @@ pub struct NeteaseProvider {
     /// 「我喜欢的音乐」歌单 ID（心动模式唯一接受的 `pid`，见
     /// [`Self::liked_playlist_id_inner`]）。首次用到时解析，之后复用。
     liked_playlist_id: std::sync::RwLock<Option<String>>,
+    /// 歌单完整 ID 列表缓存（见 [`PlaylistIdCache`]）。
+    playlist_ids: std::sync::RwLock<PlaylistIdCache>,
 }
 
 impl Default for NeteaseProvider {
@@ -144,6 +198,7 @@ impl NeteaseProvider {
             session_cookie: std::sync::RwLock::new(None),
             user_id: std::sync::RwLock::new(None),
             liked_playlist_id: std::sync::RwLock::new(None),
+            playlist_ids: std::sync::RwLock::new(PlaylistIdCache::default()),
         }
     }
 
@@ -201,6 +256,10 @@ impl NeteaseProvider {
             .expect("client lock poisoned")
             .set_cookie(cookie.clone());
         *self.session_cookie.write().expect("cookie lock poisoned") = Some(cookie);
+        self.playlist_ids
+            .write()
+            .expect("playlist cache lock poisoned")
+            .clear();
     }
 
     /// 清空会话（退出登录 / 登录失效时调用）：重建匿名客户端 + 清镜像。
@@ -212,6 +271,10 @@ impl NeteaseProvider {
             .liked_playlist_id
             .write()
             .expect("liked pid lock poisoned") = None;
+        self.playlist_ids
+            .write()
+            .expect("playlist cache lock poisoned")
+            .clear();
     }
 
     /// 记住登录态里的 userId（`/api/song/like` 必需）。
@@ -499,6 +562,19 @@ impl NeteaseProvider {
         Self::ensure_body_code(&resp.body)?;
         let lists = parse_user_playlists_response(&resp.body)?;
         tracing::info!(target: "provider", "我的歌单 {} 个", lists.len());
+        // 排查「超大歌单只加载一部分」时最需要的两个数字：谁的曲目最多、
+        // 以及接口报的总数是多少。只打前 5 大，避免刷屏。
+        let mut ranked: Vec<&crate::music::provider::PlaylistSummary> = lists.iter().collect();
+        ranked.sort_by_key(|p| std::cmp::Reverse(p.track_count.unwrap_or(0)));
+        for p in ranked.iter().take(5) {
+            tracing::info!(
+                target: "provider",
+                "歌单候选: id={} trackCount={:?} {}",
+                p.id,
+                p.track_count,
+                p.name
+            );
+        }
         Ok(lists)
     }
 
@@ -711,8 +787,13 @@ impl NeteaseProvider {
     /// 实际歌单分页实现（规范 7.3）。
     ///
     /// 两步请求（与 SDK `playlist_track_all` 同构，但保留歌单元信息）：
-    /// 1. `playlist_detail` 取元信息与完整 `trackIds`，在解析层切出分页窗口；
-    /// 2. 对窗口内 ID 走 `song_detail` 批量取详情，缺失曲目容忍跳过。
+    /// 1. `playlist_detail` 取元信息与完整 `trackIds`；
+    /// 2. 对**当前页**的 ID 走 `song_detail` 批量取详情，缺失曲目容忍跳过。
+    ///
+    /// 第 1 步的结果按歌单 ID 缓存（[`PlaylistIdCache`]）：详情接口一次就把整份
+    /// `trackIds` 带回来了，9826 首的歌单约 1 MB，每翻一页重发一次纯属浪费。
+    /// **首屏（`offset == 0`）永远重新拉取并刷新缓存**——用户可能刚在手机上给
+    /// 歌单加了歌，只有首屏能反映出来；续取走缓存也就不会拿到"半新半旧"的页。
     async fn playlist_inner(
         &self,
         playlist_id: &str,
@@ -723,42 +804,106 @@ impl NeteaseProvider {
         if limit == 0 {
             return Err(ProviderError::InvalidParameter);
         }
-        let limit = limit.min(MAX_LIMIT);
+        let limit = limit.min(MAX_PLAYLIST_LIMIT);
 
-        let query = Query::new().param("id", playlist_id);
-        tracing::debug!(target: "provider", "歌单详情: id={} offset={} limit={}", playlist_id, offset, limit);
+        let cached = if offset > 0 {
+            self.playlist_ids
+                .read()
+                .ok()
+                .and_then(|c| c.get(playlist_id))
+        } else {
+            None
+        };
 
-        let client = self.client_snapshot();
-        let response = tokio::time::timeout(self.timeouts.playlist, client.playlist_detail(&query))
-            .await
-            .map_err(|_| {
-                tracing::warn!("歌单详情超时（>{:?}）", self.timeouts.playlist);
-                ProviderError::RequestTimeout
-            })?
-            .map_err(Self::map_error)?;
-        Self::ensure_body_code(&response.body)?;
+        let entry = match cached {
+            Some(entry) => {
+                tracing::debug!(
+                    target: "provider",
+                    "歌单 ID 命中缓存: id={} offset={} 共 {} 条",
+                    playlist_id,
+                    offset,
+                    entry.ids.len()
+                );
+                entry
+            }
+            None => {
+                let query = Query::new().param("id", playlist_id);
+                tracing::debug!(target: "provider", "歌单详情: id={} offset={} limit={}", playlist_id, offset, limit);
 
-        let PlaylistWindow {
-            name,
-            total,
-            track_ids,
-        } = parse_playlist_detail_response(&response.body, offset, limit)?;
+                let client = self.client_snapshot();
+                let response =
+                    tokio::time::timeout(self.timeouts.playlist, client.playlist_detail(&query))
+                        .await
+                        .map_err(|_| {
+                            tracing::warn!("歌单详情超时（>{:?}）", self.timeouts.playlist);
+                            ProviderError::RequestTimeout
+                        })?
+                        .map_err(Self::map_error)?;
+                Self::ensure_body_code(&response.body)?;
+
+                let PlaylistWindow {
+                    name,
+                    total,
+                    available,
+                    track_ids,
+                } = parse_playlist_detail_full(&response.body)?;
+
+                tracing::info!(
+                    target: "provider",
+                    "歌单详情: id={} total={:?} 服务端 ID {} 条",
+                    playlist_id,
+                    total,
+                    available
+                );
+
+                let entry = CachedPlaylistIds {
+                    id: playlist_id.to_string(),
+                    name,
+                    total,
+                    ids: std::sync::Arc::new(track_ids),
+                };
+                if let Ok(mut cache) = self.playlist_ids.write() {
+                    cache.put(entry.clone());
+                }
+                entry
+            }
+        };
+
+        let available = entry.ids.len();
+        // `trackCount` 是歌单真实总数，`available` 是服务端这次实际给出的 ID
+        // 条数。二者不一致说明接口把 `trackIds` 截断了（实测正常歌单一致，
+        // 9826 首的也完整），此时以**实际可取条数**为上界——否则"还有更多"
+        // 永远为真，翻页只会反复拿到空页。
+        let total = crate::music::provider::effective_total(entry.total, available);
+
+        let start = (offset as usize).min(available);
+        let end = start.saturating_add(limit as usize).min(available);
+        let page_ids: Vec<String> = entry.ids[start..end].to_vec();
 
         let mut playlist = Playlist {
             provider: ProviderId::Netease,
             id: playlist_id.to_string(),
-            name,
+            name: entry.name,
             total,
             tracks: Vec::new(),
         };
 
-        if track_ids.is_empty() {
+        tracing::debug!(
+            target: "provider",
+            "歌单窗口: id={} offset={} 共 {} 条 本页 {} 条",
+            playlist_id,
+            offset,
+            available,
+            page_ids.len()
+        );
+
+        if page_ids.is_empty() {
             // 空页（offset 越界或空歌单）是合法结果，不是错误
             tracing::info!(target: "provider", "歌单分页为空: id={} offset={}", playlist_id, offset);
             return Ok(playlist);
         }
 
-        playlist.tracks = self.song_details_inner(&track_ids).await?;
+        playlist.tracks = self.song_details_inner(&page_ids).await?;
         Ok(playlist)
     }
 
@@ -1412,6 +1557,67 @@ mod tests {
             p.playlist("24381616", 0, 0).await.unwrap_err(),
             ProviderError::InvalidParameter
         );
+    }
+
+    /// 造一条缓存条目（测试用；只关心 id 与体积，内容不参与断言）。
+    fn cache_entry(id: &str) -> CachedPlaylistIds {
+        CachedPlaylistIds {
+            id: id.to_string(),
+            name: None,
+            total: None,
+            ids: std::sync::Arc::new(vec!["1".to_string()]),
+        }
+    }
+
+    #[test]
+    fn playlist_id_cache_is_bounded_and_dedupes() {
+        let mut cache = PlaylistIdCache::default();
+        let extra = 2;
+        for i in 0..(PLAYLIST_ID_CACHE + extra) {
+            cache.put(cache_entry(&format!("p{i}")));
+        }
+        assert_eq!(
+            cache.entries.len(),
+            PLAYLIST_ID_CACHE,
+            "容量必须封顶，否则翻过的每张歌单都会常驻内存"
+        );
+        assert!(cache.get("p0").is_none(), "最旧的应被淘汰");
+        let newest = format!("p{}", PLAYLIST_ID_CACHE + extra - 1);
+        assert!(cache.get(&newest).is_some(), "最新的应还在");
+
+        // 同一个 id 再次写入是**覆盖**，不能占两格（否则容量被重复项吃掉）
+        let mut updated = cache_entry(&newest);
+        updated.name = Some("新名字".to_string());
+        cache.put(updated);
+        assert_eq!(
+            cache.entries.iter().filter(|e| e.id == newest).count(),
+            1,
+            "同 id 只能有一条"
+        );
+        assert_eq!(
+            cache.get(&newest).unwrap().name.as_deref(),
+            Some("新名字"),
+            "同 id 写入必须刷新内容"
+        );
+    }
+
+    #[test]
+    fn session_change_invalidates_the_playlist_id_cache() {
+        // 换账号后私密歌单与曲目权限都可能变，跨账号复用 ID 列表会串数据
+        let p = NeteaseProvider::new();
+        p.playlist_ids.write().unwrap().put(cache_entry("24381616"));
+        assert!(p.playlist_ids.read().unwrap().get("24381616").is_some());
+
+        p.apply_session_cookie("MUSIC_U=fake".to_string());
+        assert!(
+            p.playlist_ids.read().unwrap().get("24381616").is_none(),
+            "登录态变化必须清空缓存"
+        );
+
+        // 退出登录同样要清
+        p.playlist_ids.write().unwrap().put(cache_entry("24381616"));
+        p.clear_session_cookie();
+        assert!(p.playlist_ids.read().unwrap().get("24381616").is_none());
     }
 
     #[tokio::test]

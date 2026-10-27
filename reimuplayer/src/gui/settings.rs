@@ -39,8 +39,10 @@ pub const LABEL_W: f32 = 92.0;
 /// 单测 [`tests::settings_panel_fits_its_reserved_height`] 用真实 egui
 /// 上下文量一遍，防止再靠肉眼估。
 ///
-/// 当前内容实测占用 188px（含 MEDIA KEYS\SMTC、TRAY、TEMP FILES 行），留 196 给字体度量抖动。
-pub const PANEL_H: f32 = 196.0;
+/// 当前内容实测占用 216px（阶段 23 把 LYRIC TRANS / ROMAJI 两行并成一行
+/// 「歌词转译」，比阶段 22 的 237 少了 21px），留 3 给字体度量抖动——
+/// 再大就白吃磁带架的高度了。
+pub const PANEL_H: f32 = 219.0;
 
 /// 设置面板动作（副作用由 app 执行）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +62,10 @@ pub enum SettingsAction {
     SetMediaKeys(bool),
     /// 开关托盘图标 / 关闭窗口时收进托盘。
     SetTray(bool),
+    /// 歌词是否显示中文翻译（作为辅助行显示在原文旁）。
+    SetLyricTranslation(bool),
+    /// 歌词是否显示罗马音（两个开关都开时译文优先）。
+    SetLyricRoman(bool),
     /// 切换界面语言。
     SetLang(Lang),
     /// 切换主题配色（下标指向 [`crate::gui::theme::THEMES`]）。
@@ -87,6 +93,10 @@ pub struct SettingsView {
     pub media_keys: bool,
     /// 是否启用托盘图标（关闭窗口时收进托盘）。
     pub tray: bool,
+    /// 歌词是否显示中文翻译。
+    pub lyric_translation: bool,
+    /// 歌词是否显示罗马音。
+    pub lyric_roman: bool,
     /// 当前界面语言。
     pub lang: Lang,
     /// 当前主题下标（指向 [`crate::gui::theme::THEMES`]）。
@@ -103,6 +113,7 @@ const SALT_QUALITY: &str = "row-quality";
 const SALT_DESKTOP_LYRIC: &str = "row-desktop-lyric";
 const SALT_MEDIA_KEYS: &str = "row-media-keys";
 const SALT_TRAY: &str = "row-tray";
+const SALT_LYRIC_GLOSS: &str = "row-lyric-gloss";
 const SALT_TEMP_FILES: &str = "row-temp-files";
 
 /// 一行设置：左侧固定宽标签 + 右侧控件（同一水平线，垂直居中）。
@@ -368,6 +379,108 @@ fn media_keys_row(ui: &mut Ui, view: &SettingsView) -> bool {
     toggled
 }
 
+/// 歌词转译的两个开关（互斥单选）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlossKind {
+    /// 译文。
+    Translation,
+    /// 罗马音。
+    Roman,
+}
+
+/// 把（可能非法的）两个开关归一到互斥：两个都为真时**保留译文**。
+///
+/// 用在落盘读取处：阶段 23 及以前两个开关可以同时为真（语义是"译文优先、
+/// 罗马音让位"），升级后必须拉回合法状态，否则界面上会出现两个按钮同时点亮
+/// 却只显示译文。优先级与 [`crate::music::lyrics::Lyrics::aux_text_for`] 一致。
+pub fn normalize_gloss(translation: bool, roman: bool) -> (bool, bool) {
+    if translation {
+        (true, false)
+    } else {
+        (false, roman)
+    }
+}
+
+/// 互斥切换后的新状态（纯函数）。
+///
+/// 语义（阶段 24 需求：两个按钮互斥，任意时刻最多一个激活）：
+///
+/// | 当前 | 点谁 | 结果 |
+/// | --- | --- | --- |
+/// | 都没开 | 译文 | 译文开 |
+/// | 都没开 | 罗马音 | 罗马音开 |
+/// | 译文开 | 译文（点自己） | **两个都关** |
+/// | 译文开 | 罗马音 | 罗马音开、译文关 |
+/// | 罗马音开 | 译文 | 译文开、罗马音关 |
+///
+/// "点自己 → 两个都关"是必需的：否则一旦选中任意一个，就再也没有回到
+/// "不要辅助行"的路了。
+///
+/// 返回值恒满足 `!(translation && roman)`。
+pub fn exclusive_gloss(translation: bool, roman: bool, pick: GlossKind) -> (bool, bool) {
+    match pick {
+        // 翻转自己；对方一律关掉（互斥）。点自己时自己变关 → 两个都关。
+        GlossKind::Translation => (!translation, false),
+        GlossKind::Roman => (false, !roman),
+    }
+}
+
+/// 歌词转译行：「译文」「罗马音」两个开关**互斥并排**在同一行（默认都不开）。
+///
+/// 阶段 23 合并：原来它们是两行、各带一条"上行/下行"的说明文字。两行说的是
+/// 同一件事（给歌词补一行注音 / 翻译），拆成两行既费面板高度、又让人以为它们
+/// 互不相干。抬头统一叫「歌词转译」，两个按钮各自只写自己的名字。
+///
+/// 说明文字不再写"上行 / 下行"：阶段 23 之后主窗歌词面板与桌面歌词窗的上下
+/// 顺序**不再一致**（桌面歌词按"样式回退"回了阶段 21 的版面），一句方向性
+/// 文案必然说错一边。方向信息改成悬停提示里的中性描述。
+///
+/// 阶段 24：两个按钮改成**互斥单选**（见 [`exclusive_gloss`]）——原来可以同时开、
+/// 译文优先，现在点一个就关掉另一个，再点自己则两个都关。
+fn lyric_gloss_row(ui: &mut Ui, view: &SettingsView) -> Option<SettingsAction> {
+    let mut action = None;
+    row(
+        ui,
+        SALT_LYRIC_GLOSS,
+        pick(view.lang, "歌词转译", "LYRIC GLOSS"),
+        |ui| {
+            // 两个按钮共用一个 `row` 的 id 作用域，后缀必须不同（见 `row` 的注释）
+            if widgets::tiny_button(
+                ui,
+                ui.scope_id().with("btn-lyric-translation"),
+                pick(view.lang, "译文", "TRANS"),
+                view.lyric_translation,
+            )
+            .on_hover_text(pick(
+                view.lang,
+                "显示歌词译文（与罗马音互斥）",
+                "Show the translation (exclusive with romaji)",
+            ))
+            .clicked()
+            {
+                action = Some(SettingsAction::SetLyricTranslation(!view.lyric_translation));
+            }
+            ui.add_space(6.0);
+            if widgets::tiny_button(
+                ui,
+                ui.scope_id().with("btn-lyric-roman"),
+                pick(view.lang, "罗马音", "ROMAJI"),
+                view.lyric_roman,
+            )
+            .on_hover_text(pick(
+                view.lang,
+                "显示罗马音（与译文互斥）",
+                "Show romaji (exclusive with translation)",
+            ))
+            .clicked()
+            {
+                action = Some(SettingsAction::SetLyricRoman(!view.lyric_roman));
+            }
+        },
+    );
+    action
+}
+
 /// 托盘行：开关 + 说明（默认关闭）。
 fn tray_row(ui: &mut Ui, view: &SettingsView) -> bool {
     let mut toggled = false;
@@ -474,6 +587,10 @@ pub fn settings_panel(ui: &mut Ui, view: &SettingsView) -> SettingsAction {
         action = a;
     }
     ui.add_space(6.0);
+    if let Some(a) = lyric_gloss_row(ui, view) {
+        action = a;
+    }
+    ui.add_space(6.0);
     if media_keys_row(ui, view) {
         action = SettingsAction::SetMediaKeys(!view.media_keys);
     }
@@ -561,6 +678,8 @@ mod tests {
             quality: QualityCeiling::Lossless,
             desktop_lyric: false,
             lyric_progress: ProgressStyle::Line,
+            lyric_translation: false,
+            lyric_roman: false,
             hook_ready: false,
             media_keys: true,
             tray: false,
@@ -596,6 +715,40 @@ mod tests {
     }
 
     #[test]
+    fn gloss_switches_are_exclusive() {
+        // 阶段 24：任意时刻最多一个为真。穷举全部合法前置态 × 两个按钮，
+        // 顺便钉住"点自己 = 翻转"（否则回不到两个都关的状态）。
+        for translation in [false, true] {
+            for roman in [false, true] {
+                if translation && roman {
+                    continue; // 非法前置态，由 normalize_gloss 负责
+                }
+                for pick in [GlossKind::Translation, GlossKind::Roman] {
+                    let (t, r) = exclusive_gloss(translation, roman, pick);
+                    assert!(
+                        !(t && r),
+                        "互斥被破坏：({translation},{roman}) 点 {pick:?} -> ({t},{r})"
+                    );
+                    let (before, after) = match pick {
+                        GlossKind::Translation => (translation, t),
+                        GlossKind::Roman => (roman, r),
+                    };
+                    assert_eq!(after, !before, "点自己必须翻转：{pick:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_gloss_keeps_translation_when_both_are_on() {
+        // 老文件可能两个都开（那时是"译文优先、罗马音让位"）→ 归一成只有译文
+        assert_eq!(normalize_gloss(true, true), (true, false));
+        assert_eq!(normalize_gloss(true, false), (true, false));
+        assert_eq!(normalize_gloss(false, true), (false, true));
+        assert_eq!(normalize_gloss(false, false), (false, false));
+    }
+
+    #[test]
     fn every_action_variant_is_distinct() {
         // 新增动作时若不慎让两个变体相等，match 分支会互相吞掉
         let all = [
@@ -603,6 +756,8 @@ mod tests {
             SettingsAction::SetQuality(QualityCeiling::Standard),
             SettingsAction::SetDesktopLyric(false),
             SettingsAction::SetDesktopLyricProgress(ProgressStyle::Acid),
+            SettingsAction::SetLyricTranslation(true),
+            SettingsAction::SetLyricRoman(true),
             SettingsAction::SetMediaKeys(false),
             SettingsAction::SetTray(false),
             SettingsAction::SetLang(Lang::Zh),

@@ -543,18 +543,21 @@ pub fn margin_window() -> Margin {
 // §1.2 字号（egui 用 point 近似逻辑像素）
 // ---------------------------------------------------------------------------
 
-/// `type/window-title` 12 / 800。
-pub const FONT_WINDOW_TITLE: f32 = 12.0;
-/// `type/label` 10 / 800。
-pub const FONT_LABEL: f32 = 10.0;
-/// `type/tiny` 9 / 500。
-pub const FONT_TINY: f32 = 9.0;
-/// `type/track-title` 24 / 900。
-pub const FONT_TRACK_TITLE: f32 = 24.0;
-/// `type/spine-name` 11.5 / 900。
-pub const FONT_SPINE_NAME: f32 = 11.5;
-/// `type/spine-artist` 8 / 500。
-pub const FONT_SPINE_ARTIST: f32 = 8.0;
+/// `type/window-title` 13 / 800。
+///
+/// 阶段 22 整体上调约 10%：原表（12/10/9/24…）是照 1600×900 的设计稿定的，
+/// 在 2K / 125% 的实际桌面上肉眼偏小，用户反馈"全局字体偏小"。
+pub const FONT_WINDOW_TITLE: f32 = 13.0;
+/// `type/label` 11 / 800。
+pub const FONT_LABEL: f32 = 11.0;
+/// `type/tiny` 10 / 500。
+pub const FONT_TINY: f32 = 10.0;
+/// `type/track-title` 26 / 900。
+pub const FONT_TRACK_TITLE: f32 = 26.0;
+/// `type/spine-name` 13 / 900。
+pub const FONT_SPINE_NAME: f32 = 13.0;
+/// `type/spine-artist` 9 / 500。
+pub const FONT_SPINE_ARTIST: f32 = 9.0;
 
 // §1.2 字距（em；px = em × 字号，§9 经 LayoutJob 逐字插间距实现）
 /// `type/window-title` +0.12em。
@@ -576,12 +579,12 @@ pub const TRACKING_CASS_TITLE: f32 = -0.03;
 /// 卡带副行 +0.14em（7.5）。
 pub const TRACKING_CASS_ARTIST: f32 = 0.14;
 
-/// 卡带主标题字号（14 / 900）。
-pub const FONT_CASS_TITLE: f32 = 14.0;
-/// 卡带副行字号（7.5）。
-pub const FONT_CASS_ARTIST: f32 = 7.5;
-/// 卡带标签行字号（7 / 800）。
-pub const FONT_CASS_LABEL: f32 = 7.0;
+/// 卡带主标题字号（16 / 900）。
+pub const FONT_CASS_TITLE: f32 = 16.0;
+/// 卡带副行字号（8.5）。
+pub const FONT_CASS_ARTIST: f32 = 8.5;
+/// 卡带标签行字号（8 / 800）。
+pub const FONT_CASS_LABEL: f32 = 8.0;
 
 /// `type/spine-artist` 的 62% 不透明度（§1.2 表）。
 pub const SPINE_ARTIST_ALPHA: u8 = 158; // 255 × 0.62

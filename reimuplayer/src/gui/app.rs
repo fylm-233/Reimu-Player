@@ -100,8 +100,29 @@ impl Page {
     }
 }
 
-/// 搜索/歌单请求页大小。
+/// 搜索请求页大小。
 const PAGE_LIMIT: u32 = 30;
+
+/// 歌单每页曲目数（首屏与「加载更多」同尺寸）。
+///
+/// 与 Provider 的 `MAX_PLAYLIST_LIMIT`（200）对齐，正好不被截。列表行已做
+/// 虚拟化（`ScrollArea::show_rows`），单页行数不再影响帧率，因此取到上限，
+/// 把 9826 首这种量级的翻页次数压到 49 次；再加上滚到底自动续取，用户实际
+/// 不需要手动点。
+const PLAYLIST_PAGE: u32 = 200;
+
+/// 推荐/榜单「原地详情」的每页曲目数。
+///
+/// 比歌单页小一半：peek 用 spine 列表，**没有虚拟化**（spine 有投影与纹理，
+/// 行高要靠 `add_space` 拼，`show_rows` 的固定行高模型套不上），一次铺 200 条
+/// 会明显压帧。100 条配滚到底自动续取已经够用。
+const PEEK_PAGE: u32 = 100;
+
+/// 列表底部剩余多少像素时自动续取下一页（约 7 行）。
+///
+/// 留一点提前量而不是"滚到最后一像素"才触发：否则用户滑到底会先看到一片
+/// 空白等请求回来。取 240px 既能提前，又不至于刚打开列表就触发。
+const AUTO_LOAD_MORE_GAP: f32 = 240.0;
 
 /// 已载入歌单历史的上限（超出淘汰最久未打开的一张）。
 const PLAYLIST_HISTORY_LIMIT: usize = 12;
@@ -319,6 +340,15 @@ pub(crate) struct PlaylistPeek {
     pub seq: u64,
     /// 曲目加载状态（只持有一份数据）。
     pub state: LoadState<Playlist>,
+    /// 已取到的曲目数（= 下一次续取的 `offset`）。
+    ///
+    /// 续取刻意**不走** [`LoadState`]：`begin_load` 会释放旧数据（规范 9.2），
+    /// 而"加载更多"要保留已显示的曲目往后追加，所以它有自己的 seq 与计数。
+    pub offset: u32,
+    /// 是否还有未取曲目（按接口 `total` 判断）。
+    pub has_more: bool,
+    /// 在途续取的 seq；`0` = 没有在途续取。
+    pub more_seq: u64,
     /// 是否正展开（收起后保留数据）。
     pub expanded: bool,
 }
@@ -328,6 +358,12 @@ pub(crate) struct PlaylistPeek {
 enum PeekHit {
     None,
     Play(usize),
+    /// 整单播放：以这张歌单的**已取到曲目**替换磁带架与播放队列。
+    PlayAll,
+    /// 整单随机播放：同上，并把播放模式切到随机档。
+    ShuffleAll,
+    /// 续取下一页。
+    LoadMore,
     Back,
 }
 
@@ -434,6 +470,75 @@ fn history_window_label(hours: i64, lang: Lang) -> String {
     }
 }
 
+/// 把续取到的一页拼到已有曲目尾部（按 ID 去重）。
+///
+/// 歌单分页是"再切一段 `trackIds`"，边界上可能重叠（歌单在两次请求之间被
+/// 改动过），所以按 ID 去重而不是无脑 `extend`。`id` 不同说明期间换了歌单，
+/// 直接以新页为准——串数据比丢一页更糟。
+fn merge_playlist_page(previous: Option<Playlist>, page: Playlist) -> Playlist {
+    let Some(mut base) = previous else {
+        return page;
+    };
+    if base.id != page.id {
+        return page;
+    }
+    for track in page.tracks {
+        if !base.tracks.iter().any(|t| t.id == track.id) {
+            base.tracks.push(track);
+        }
+    }
+    base.total = page.total.or(base.total);
+    base
+}
+
+/// 是否还有未取曲目：按接口 `total`（真实总数）判断，不看已取条数。
+fn page_has_more(playlist: &Playlist) -> bool {
+    playlist
+        .total
+        .is_some_and(|total| (playlist.tracks.len() as u64) < total)
+}
+
+/// 滚动区是否已接近底部（触发自动续取）。
+///
+/// 单独抽成纯函数是因为歌单页与 peek 两处判定必须**完全一致**——一处早一处晚，
+/// 用户就会看到"这个列表会自动加载、那个不会"的割裂感；纯函数也让阈值可以
+/// 直接断言，不必搭 egui 上下文。
+///
+/// `content` / `offset` / `viewport` 都取 `ScrollAreaOutput` 的滚动坐标
+/// （`content_size.y` / `clamped_offset().y` / `inner_rect.height()`）。
+///
+/// 两个必要条件：
+/// - 内容确实超出视口（`content > viewport`）：否则短列表一进来就"在底部"，
+///   会无限续取到把整个歌单拉完；
+/// - 剩余可滚距离小于 [`AUTO_LOAD_MORE_GAP`]：留提前量，避免滑到底先看到空白。
+fn near_list_bottom(content: f32, offset: f32, viewport: f32) -> bool {
+    let scrollable = content > viewport + 1.0;
+    scrollable && (content - (offset + viewport)) < AUTO_LOAD_MORE_GAP
+}
+
+/// 把系统剪贴板内容作为 [`egui::Event::Paste`] 注入**当前帧**。
+///
+/// 前提背景见 [`super::clipboard`] 的模块文档：项目没有启用 eframe 的
+/// `clipboard` feature，所以 egui-winit 永远不产生粘贴事件。
+///
+/// 三个要点：
+/// - **每帧只在 [`ReimuApp::ui`] 开头调用一次**。`key_pressed` 不消费按键，
+///   若在每个输入框之前各调一次，同一帧里多个 `TextEdit` 会各注入一份，
+///   变成"粘贴 N 遍"。
+/// - 注入的是当前帧的 `events`，同帧的 `TextEdit` 就能读到（`TextEdit`
+///   在绘制时才读输入队列）。
+/// - 只在按下 Ctrl+V 的那一帧读剪贴板：剪贴板是独占资源，没必要每帧去开。
+fn inject_paste(ui: &egui::Ui) {
+    let pressed = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V));
+    if !pressed {
+        return;
+    }
+    if let Some(text) = super::clipboard::read_text() {
+        ui.ctx()
+            .input_mut(|i| i.events.push(egui::Event::Paste(text)));
+    }
+}
+
 /// 用户数据装载：生产读真实配置目录，测试恒取默认值。
 ///
 /// 测试里 `assemble()` 会被构造无数次，若直连 `%APPDATA%` 就会读写真实用户
@@ -489,6 +594,21 @@ pub struct ReimuApp {
     playlist_jump: bool,
     /// 本次歌单请求成功后是否自动播放第一首（榜单行 ▶ / 双击）。
     playlist_autoplay: bool,
+    /// 当前歌单已取到的曲目数（= 下一次续取的 `offset`）。
+    playlist_offset: u32,
+    /// 当前歌单是否还有未取曲目（按接口 `total` 判断）。
+    playlist_has_more: bool,
+    /// 在途续取的 seq；`0` = 没有在途续取。
+    ///
+    /// 与 `playlist_seq` 分开：续取是**追加**，不能用首屏那套
+    /// `LoadState`（`begin_load` 会释放已显示的列表）。
+    playlist_more_seq: u64,
+    /// 在途续取是否为「滚到底自动触发」。
+    ///
+    /// 自动续取一屏能连发几十次（9826 首 ≈ 49 页），每次都弹「已加载 N / M 首」
+    /// 会把 toast 刷屏；面板头的「已取 / 共」已经给了足够的进度反馈，所以自动
+    /// 续取静默，只有用户主动点「加载更多」才提示。
+    playlist_more_auto: bool,
 
     // ---- 请求序列号（过期响应丢弃）----
     search_seq: u64,
@@ -686,6 +806,13 @@ pub struct ReimuApp {
     /// （阶段 16 踩过：一次 `OPACITY=0` 的截图跑完就把 0% 写进了 prefs.json，
     /// 下次正常启动桌面歌词只剩文字、背景全没了，看起来像"窗口不见了"。）
     lyric_opacity_frozen: Option<u8>,
+    /// 歌词翻译轨是否显示（设置面板开关 → 主窗口歌词 + 桌面歌词同步）。
+    ///
+    /// 只影响**渲染**：接口一直会返回 `tlyric`，解析层也一直带着
+    /// （`Lyrics::translation`），这里只决定要不要多画一行。
+    lyric_translation: bool,
+    /// 歌词罗马音轨是否显示。与翻译同开时让位给译文（方案 B）。
+    lyric_roman: bool,
 
     // ---- 用户数据（本地持久化：历史 / 收藏 / 自建歌单）----
     /// 播放历史（"听够"才记，见 [`super::history::qualifies`]）。
@@ -893,6 +1020,10 @@ impl ReimuApp {
             playlist_input: String::new(),
             playlist_jump: false,
             playlist_autoplay: false,
+            playlist_offset: 0,
+            playlist_has_more: false,
+            playlist_more_seq: 0,
+            playlist_more_auto: false,
             search_seq: 0,
             detail_seq: 0,
             playlist_seq: 0,
@@ -970,6 +1101,9 @@ impl ReimuApp {
             // 测试环境不落盘，透明度/样式就是默认值；真实启动在 `new()` 里按 prefs 恢复
             lyric_control: Arc::new(super::lyric_control::LyricControl::new()),
             lyric_opacity_frozen: None,
+            // 测试环境不落盘，两个开关就是默认关；真实启动在 `new()` 里按 prefs 恢复
+            lyric_translation: false,
+            lyric_roman: false,
             // 用户数据：测试环境一律取默认值（绝不读写真实 `%APPDATA%`）
             history: user_data(super::history::PlayHistory::load),
             favorites: user_data(super::favorites::Favorites::load),
@@ -1114,6 +1248,9 @@ impl ReimuApp {
             prefs.lyric_opacity,
             prefs.lyric_progress,
         ));
+        // 两个辅助歌词轨开关：只影响渲染，不影响解析（解析层一直带着）
+        app.lyric_translation = prefs.lyric_translation;
+        app.lyric_roman = prefs.lyric_roman;
         // 视觉校对：探针要求时先把锁定态与透明度摆到指定值（截图用）
         #[cfg(debug_assertions)]
         {
@@ -1287,9 +1424,39 @@ impl ReimuApp {
         self.playlist_input = playlist_id.to_string();
         self.playlist_jump = jump;
         self.playlist_autoplay = autoplay;
-        self.playlist_seq = self.bridge.playlist(playlist_id, 0, PAGE_LIMIT);
+        // 首屏：清掉上一张歌单的续取进度，否则新歌单会从旧 offset 开始续
+        self.playlist_offset = 0;
+        self.playlist_has_more = false;
+        self.playlist_more_seq = 0;
+        self.playlist_seq = self.bridge.playlist(playlist_id, 0, PLAYLIST_PAGE);
         self.playlist_state.begin_load();
         self.push_toast(self.t("正在载入歌单…", "Loading playlist…"));
+    }
+
+    /// 续取当前歌单的下一页（「加载更多」/ 滚到底自动触发）。
+    ///
+    /// 追加语义：新页拼到已载入歌单尾部，**不**重置浏览列表、**不**重排队列起点
+    /// （否则用户点了"加载更多"会被拽回第一首）。若播放队列正好就是这张歌单，
+    /// 一起延长——队列比列表短会让"下一首"在第 50 首处停下。
+    ///
+    /// `auto` 为真表示由「滚到底」触发：一屏内可能连发几十次，此时不弹
+    /// 「已加载 N / M 首」的 toast（见 `playlist_more_auto` 的说明）。
+    fn load_more_playlist(&mut self, auto: bool) {
+        if self.playlist_more_seq != 0 || !self.playlist_has_more {
+            return;
+        }
+        let Some(pos) = self.active_playlist else {
+            return;
+        };
+        let Some(playlist) = self.playlists.get(pos) else {
+            return;
+        };
+        let id = playlist.id.clone();
+        let offset = playlist.tracks.len() as u32;
+        // 刻意不写 `playlist_input`：那是「手动输入 ID」框的内容，续取不该把它冲掉
+        self.playlist_offset = offset;
+        self.playlist_more_auto = auto;
+        self.playlist_more_seq = self.bridge.playlist(id, offset, PLAYLIST_PAGE);
     }
 
     /// 记入「已载入」历史：同 ID 原地更新，超过上限淘汰最久未访问的一张。
@@ -1367,7 +1534,7 @@ impl ReimuApp {
                 return;
             }
         }
-        let seq = self.bridge.playlist(id.to_string(), 0, PAGE_LIMIT);
+        let seq = self.bridge.playlist(id.to_string(), 0, PEEK_PAGE);
         let mut state = LoadState::new();
         state.begin_load();
         *self.peek_mut(panel) = Some(PlaylistPeek {
@@ -1375,6 +1542,9 @@ impl ReimuApp {
             subtitle: subtitle.to_string(),
             seq,
             state,
+            offset: 0,
+            has_more: false,
+            more_seq: 0,
             expanded: true,
         });
     }
@@ -1394,10 +1564,23 @@ impl ReimuApp {
     }
 
     /// 这个 seq 属于哪个面板的原地详情（响应归位用）。
-    fn peek_seq_match(&self, seq: u64) -> Option<PeekPanel> {
+    ///
+    /// 返回 `(面板, 是否续取)`：首屏与续取的响应都走 `Response::Playlist`，
+    /// 只能靠 seq 区分——首屏替换状态，续取追加曲目。
+    fn peek_seq_match(&self, seq: u64) -> Option<(PeekPanel, bool)> {
         [PeekPanel::Rec, PeekPanel::Chart]
             .into_iter()
-            .find(|panel| self.peek(*panel).is_some_and(|peek| peek.seq == seq))
+            .find_map(|panel| {
+                self.peek(panel).and_then(|peek| {
+                    if peek.seq == seq {
+                        Some((panel, false))
+                    } else if peek.more_seq != 0 && peek.more_seq == seq {
+                        Some((panel, true))
+                    } else {
+                        None
+                    }
+                })
+            })
     }
 
     /// 当前是否展开着详情（渲染分支用）。
@@ -1437,6 +1620,62 @@ impl ReimuApp {
         self.selected = Some(index);
         self.replace_queue(tracks);
         self.play_track(track);
+    }
+
+    /// 原地详情里「播放全部 / 随机播放全部」。
+    ///
+    /// 与 [`Self::play_peek_track`] 同一套语义（替换磁带架 + 替换队列），区别只在
+    /// 起点：`shuffle` 为真时先把播放模式切到随机档，再让队列从头消费洗牌序列。
+    ///
+    /// 为什么必须先 `replace_queue` 再 `set_play_mode`：`replace_queue` 会把
+    /// `shuffle_order` 作废（列表换了），顺序反过来的话刚设的档位会撞上一条
+    /// 指向旧列表的洗牌序列。
+    fn play_peek_all(&mut self, panel: PeekPanel, shuffle: bool) {
+        let Some(list) = self.peek(panel).and_then(|p| p.state.get()).cloned() else {
+            return;
+        };
+        if list.tracks.is_empty() {
+            self.push_toast(self.t(
+                "这张歌单暂时没有可播放的曲子",
+                "This playlist has no playable tracks right now",
+            ));
+            return;
+        }
+        let tracks = list.tracks.clone();
+        let idx = self.remember_loaded_playlist(list);
+        self.clear_user_view();
+        self.active_local = false;
+        self.active_playlist = Some(idx);
+        self.selected = Some(0);
+        self.replace_queue(tracks);
+        if shuffle {
+            self.core.set_play_mode(PlayMode::Shuffle);
+            self.shuffle_order = None;
+        }
+        // 直接播队首，不走 `play_selected`：那条路会再 `adopt_queue` 一次，
+        // 把刚建好的队列按当前浏览列表重建，多一次无谓的洗牌作废。
+        if let Some(first) = self.queue.first().cloned() {
+            self.play_track(first);
+        }
+        let mode = self.play_mode_label(self.core.play_mode());
+        self.push_toast(self.t(
+            &format!("{} · {} 首", mode, self.queue.len()),
+            &format!("{} · {} tracks", mode, self.queue.len()),
+        ));
+    }
+
+    /// 原地详情续取下一页（滚动区底部「加载更多」）。
+    fn load_more_peek(&mut self, panel: PeekPanel) {
+        let Some(peek) = self.peek(panel) else { return };
+        if peek.more_seq != 0 || !peek.has_more {
+            return;
+        }
+        let id = peek.id.clone();
+        let offset = peek.offset;
+        let seq = self.bridge.playlist(id, offset, PEEK_PAGE);
+        if let Some(peek) = self.peek_mut(panel).as_mut() {
+            peek.more_seq = seq;
+        }
     }
 
     /// 移除一张已载入歌单（不动自建歌单/账号歌单）。
@@ -1762,9 +2001,13 @@ impl ReimuApp {
         self.playlist_input = playlist_id;
         self.playlist_jump = false;
         self.playlist_autoplay = false;
+        // 与 `load_playlist_id` 同：首屏必须清掉续取进度
+        self.playlist_offset = 0;
+        self.playlist_has_more = false;
+        self.playlist_more_seq = 0;
         self.playlist_seq = self
             .bridge
-            .playlist(self.playlist_input.clone(), 0, PAGE_LIMIT);
+            .playlist(self.playlist_input.clone(), 0, PLAYLIST_PAGE);
         self.playlist_state.begin_load();
     }
 
@@ -2121,17 +2364,53 @@ impl ReimuApp {
                         self.handle_error("DETAIL FAILED", &e);
                     }
                 },
-                // 推荐页 / 每日页原地详情：只落进对应面板，**不写进已载入历史**。
+                // 推荐页 / 榜单页原地详情：只落进对应面板，**不写进已载入历史**。
+                // 首屏替换状态；「加载更多」只追加曲目、**不动 `state`**
+                // （`begin_load` 会释放旧数据，列表会当场闪空）。
                 Response::Playlist { seq, result } if self.peek_seq_match(seq).is_some() => {
-                    if let Ok(list) = &result {
-                        for t in &list.tracks {
+                    let Some((panel, is_more)) = self.peek_seq_match(seq) else {
+                        continue;
+                    };
+                    if let Ok(page) = &result {
+                        for t in &page.tracks {
                             self.known.insert(t.id.clone(), t.clone());
                         }
                     }
-                    if let Some(panel) = self.peek_seq_match(seq) {
-                        if let Some(peek) = self.peek_mut(panel) {
-                            peek.state.finish(result);
+                    if is_more {
+                        let mut failed: Option<ProviderError> = None;
+                        if let Some(peek) = self.peek_mut(panel).as_mut() {
+                            peek.more_seq = 0;
+                            match result {
+                                Ok(page) => {
+                                    let previous = peek.state.get().cloned();
+                                    let before = previous
+                                        .as_ref()
+                                        .map(|p| p.tracks.len())
+                                        .unwrap_or_default();
+                                    let merged = merge_playlist_page(previous, page);
+                                    peek.offset = merged.tracks.len() as u32;
+                                    // 本页一条都没进来就停止续取，否则 offset 不动、
+                                    // 下一轮还是同一页，用户永远点不完
+                                    peek.has_more =
+                                        merged.tracks.len() > before && page_has_more(&merged);
+                                    peek.state.finish(Ok(merged));
+                                }
+                                Err(e) => {
+                                    // 续取失败不清空已显示的曲目：这是"加载更多"，
+                                    // 不是"重载"。停止再试，让用户点重开。
+                                    peek.has_more = false;
+                                    failed = Some(e);
+                                }
+                            }
                         }
+                        if let Some(e) = failed {
+                            self.handle_error("PLAYLIST PAGE FAILED", &e);
+                        }
+                    } else if let Some(peek) = self.peek_mut(panel).as_mut() {
+                        peek.more_seq = 0;
+                        peek.offset = result.as_ref().map(|p| p.tracks.len() as u32).unwrap_or(0);
+                        peek.has_more = result.as_ref().map(page_has_more).unwrap_or(false);
+                        peek.state.finish(result);
                     }
                 }
                 Response::Playlist { seq, result } if seq == self.playlist_seq => {
@@ -2164,6 +2443,11 @@ impl ReimuApp {
                             if jump {
                                 self.set_page(Page::Playlist);
                             }
+                            // 续取进度按接口 `total` 记账：面板计数与「加载更多」
+                            // 都靠它，不能再拿 `tracks.len()` 冒充总数。
+                            self.playlist_offset = n as u32;
+                            self.playlist_has_more = page_has_more(&playlist);
+                            self.playlist_more_seq = 0;
                             self.playlist_state.finish(Ok(playlist));
                             // 显式"播放"：用刚载入的列表建立新队列并从第一首开始。
                             // 与浏览动作分开：只是载入时绝不偷换正在播放的队列。
@@ -2190,6 +2474,81 @@ impl ReimuApp {
                             ));
                         }
                         Err(e) => self.handle_error("PLAYLIST FAILED", &e),
+                    }
+                }
+                // 歌单页「加载更多」：**追加**到已载入歌单尾部。
+                // 不碰 `playlist_state`（那是首屏状态机，`begin_load` 会清空列表），
+                // 也不重置 `active_playlist` / 选中行——用户点"加载更多"不该被拽回第一首。
+                Response::Playlist { seq, result } if seq == self.playlist_more_seq => {
+                    self.playlist_more_seq = 0;
+                    // 自动续取（滚到底）静默：一屏能连发几十次，逐条 toast 会刷屏
+                    let auto = std::mem::take(&mut self.playlist_more_auto);
+                    match result {
+                        Ok(page) => {
+                            for t in &page.tracks {
+                                self.known.insert(t.id.clone(), t.clone());
+                            }
+                            let page_total = page.total;
+                            let page_id = page.id.clone();
+                            // 借用 `self.playlists` 期间不能调 `&mut self` 的方法
+                            // （`push_toast`），所以把结果先提出来再收尾。
+                            let Some(pos) = self.active_playlist else {
+                                continue;
+                            };
+                            let (loaded, has_more) = {
+                                let Some(existing) = self.playlists.get_mut(pos) else {
+                                    continue;
+                                };
+                                // 期间换过歌单：这一页属于旧歌单，丢弃（不能串数据）
+                                if existing.id != page_id {
+                                    continue;
+                                }
+                                let before = existing.tracks.len();
+                                for track in page.tracks {
+                                    // 分页边界可能重叠，按 ID 去重
+                                    if !existing.tracks.iter().any(|t| t.id == track.id) {
+                                        existing.tracks.push(track);
+                                    }
+                                }
+                                existing.total = page_total.or(existing.total);
+                                // 队列正好是这张歌单的前 `before` 首 → 一起延长。
+                                // 不同步的话"列表 100 首、队列 50 首"，播到 50 就停。
+                                if self.queue_active && self.queue.len() == before {
+                                    self.queue.extend(existing.tracks[before..].iter().cloned());
+                                }
+                                // 本页一条都没进来（整页详情都解析失败）就停止续取，
+                                // 否则 offset 不变、下一轮还是同一页 → 点不完的死循环
+                                let grown = existing.tracks.len() > before;
+                                (existing.tracks.len(), grown && page_has_more(existing))
+                            };
+                            self.playlist_offset = loaded as u32;
+                            self.playlist_has_more = has_more;
+                            let total = self
+                                .playlists
+                                .get(pos)
+                                .and_then(|p| p.total)
+                                .unwrap_or(loaded as u64);
+                            // 续取把列表拉长了，`list_fingerprint` 随之改变。若不在这里
+                            // 对齐，下一帧 `ui_result_rows` 会判定"列表换了"并把滚动条
+                            // 拽回顶部——滚到底自动续取就永远停在第 200 首。
+                            self.res_scroll_fp = self.list_fingerprint();
+                            if !auto {
+                                self.push_toast(self.t(
+                                    &format!("已加载 {loaded} / {total} 首"),
+                                    &format!("LOADED {loaded} / {total}"),
+                                ));
+                            } else {
+                                tracing::debug!(
+                                    target: "gui",
+                                    "自动续取完成: {loaded} / {total}"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            // 续取失败不清空已有曲目，只停止再试
+                            self.playlist_has_more = false;
+                            self.handle_error("PLAYLIST PAGE FAILED", &e);
+                        }
                     }
                 }
                 Response::Featured { seq, result } => {
@@ -2636,7 +2995,11 @@ impl ReimuApp {
         clear!(self.search_seq, self.search_state);
         clear!(self.detail_seq, self.detail_state);
         clear!(self.playlist_seq, self.playlist_state);
+        clear!(self.playlist_more_seq);
         self.playlist_autoplay = false;
+        self.playlist_has_more = false;
+        self.playlist_offset = 0;
+        self.playlist_more_auto = false;
         clear!(self.rec_seq, self.rec_state);
         clear!(self.chart_seq, self.chart_state);
         clear!(self.daily_seq, self.daily_state);
@@ -2783,6 +3146,18 @@ impl ReimuApp {
             return p.tracks.as_slice();
         }
         self.search_state.get().map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// 右栏当前是否显示「可续取的在线歌单」。
+    ///
+    /// `playlist_has_more` 是全局字段，但右栏同时也会显示收藏/最近播放/本地曲库；
+    /// 那些视图下"加载更多"毫无意义（数据不是分页取的），必须按当前来源判定，
+    /// 不能只看标记位。
+    fn playlist_more_visible(&self) -> bool {
+        self.playlist_has_more
+            && self.user_view == UserView::None
+            && !self.active_local
+            && self.active_playlist.is_some()
     }
 
     /// 播放队列（最近一次开始播放时的列表快照）。
@@ -4116,6 +4491,8 @@ impl ReimuApp {
                 .lyric_opacity_frozen
                 .unwrap_or_else(|| self.lyric_control.opacity()),
             lyric_progress: self.lyric_control.progress(),
+            lyric_translation: self.lyric_translation,
+            lyric_roman: self.lyric_roman,
             // 静音时落盘"静音前音量"，下次取消静音仍是用户熟悉的响度
             volume: if self.muted {
                 (self.pre_mute_volume.clamp(0.0, 1.0) * 100.0).round() as u8
@@ -4293,6 +4670,15 @@ impl ReimuApp {
         self.shuffle_seed = self.shuffle_seed.wrapping_add(1);
         let mut order: Vec<usize> = (0..len).collect();
         let mut rng: u64 = seed ^ 0x9E37_79B9_7F4A_7C15;
+        if rng == 0 {
+            // 0 是 xorshift64 的**不动点**：`shuffle_seed` 初值恰好等于上面这个
+            // 常量，进程内首次构建时 rng 必然是 0 → 每轮 `j = rng % (i+1) = 0`
+            // → Fisher-Yates 退化成「每个 i 与 0 交换」→ 排列恒为
+            // `[1,2,…,n-1,0]`，也就是**磁带架顺序右移一位**。
+            // 用户看到的现象：随机档点 ⏭ 却按磁带架顺序走，自然播完却又「像随机」
+            // （那时序列已被作废重建、种子已推进）。任意非零值即可跳出不动点。
+            rng = 0x2545_F491_4F6C_DD1D;
+        }
         for i in (1..len).rev() {
             rng ^= rng << 13;
             rng ^= rng >> 7;
@@ -4842,7 +5228,14 @@ impl ReimuApp {
         let index = self.core.active_lyric();
         let line_of = |i: usize| lyrics.and_then(|l| l.lines.get(i)).map(|l| l.text.as_str());
         let line = index.and_then(line_of);
-        let next = index.and_then(|i| line_of(i + 1));
+        // 辅助行（译文 / 罗马音）：两个开关都关时恒 `None`，桌面歌词的渲染
+        // 路径就与加这个功能之前完全一致。
+        let aux = match (index, lyrics) {
+            (Some(i), Some(l)) => {
+                l.aux_text_for(i, self.lyric_translation, self.lyric_roman)
+            }
+            _ => None,
+        };
         // 行内进度：本行起点 → 下一行起点（末行按 4 秒估，只用于逐字染色）
         let progress = match (index, lyrics) {
             (Some(i), Some(l)) => {
@@ -4865,7 +5258,7 @@ impl ReimuApp {
             title,
             artist,
             line,
-            next,
+            aux,
             line_progress: progress,
             playing,
         };
@@ -5589,35 +5982,43 @@ impl ReimuApp {
     /// 歌词面板（时间轴同步 + 点击行 seek + 换行滚到中心）。
     fn ui_lyrics(&mut self, ui: &mut Ui, height: f32) {
         let note = self.core.session().lyric_note();
-        let empty_text = String::new();
         let fallback;
-        let rows_data: Vec<(String, String)> = match self.core.session().lyrics() {
-            Some(lyrics) => lyrics
-                .lines
-                .iter()
-                .map(|l| {
-                    (
-                        format_duration(Duration::from_millis(l.start_ms)),
-                        l.text.clone(),
-                    )
-                })
-                .collect(),
-            None => {
-                // `note` 是类型化的歌词侧提示（本地文件无歌词 / 暂无 / 失败），
-                // 措辞在这里按界面语言渲染——核心层不产出用户可见文案
-                fallback = note.map(|n| n.message(self.lang)).unwrap_or_else(|| {
-                    self.t("装载后显示歌词", "Lyrics appear after loading")
-                        .to_string()
-                });
-                vec![(String::new(), fallback.clone())]
-            }
-        };
-        let _ = empty_text;
+        let show_trans = self.lyric_translation;
+        let show_roman = self.lyric_roman;
+        // (时间戳, 原文, 辅助行)：辅助行按「译文优先、罗马音补位」算好，
+        // 两个开关都关时恒 `None`——此时渲染结果与加这个功能之前完全一致。
+        let rows_data: Vec<(String, String, Option<String>)> =
+            match self.core.session().lyrics() {
+                Some(lyrics) => lyrics
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| {
+                        (
+                            format_duration(Duration::from_millis(l.start_ms)),
+                            l.text.clone(),
+                            lyrics
+                                .aux_text_for(i, show_trans, show_roman)
+                                .map(str::to_string),
+                        )
+                    })
+                    .collect(),
+                None => {
+                    // `note` 是类型化的歌词侧提示（本地文件无歌词 / 暂无 / 失败），
+                    // 措辞在这里按界面语言渲染——核心层不产出用户可见文案
+                    fallback = note.map(|n| n.message(self.lang)).unwrap_or_else(|| {
+                        self.t("装载后显示歌词", "Lyrics appear after loading")
+                            .to_string()
+                    });
+                    vec![(String::new(), fallback.clone(), None)]
+                }
+            };
         let rows: Vec<LyricRow> = rows_data
             .iter()
-            .map(|(t, x)| LyricRow {
+            .map(|(t, x, aux)| LyricRow {
                 time_text: t.as_str(),
                 text: x.as_str(),
+                aux: aux.as_deref(),
             })
             .collect();
         let clicked = widgets::lyric_panel(
@@ -6058,6 +6459,8 @@ impl ReimuApp {
             quality: self.bridge.quality(),
             desktop_lyric: self.desktop_lyric.enabled(),
             lyric_progress: self.lyric_control.progress(),
+            lyric_translation: self.lyric_translation,
+            lyric_roman: self.lyric_roman,
             hook_ready: self.desktop_lyric.has_sink(),
             media_keys: self.media_keys_enabled,
             tray: self.tray_enabled,
@@ -6117,6 +6520,44 @@ impl ReimuApp {
                     self.t("歌词进度条", "Lyric progress bar"),
                     style.label(self.lang)
                 );
+                self.push_toast(msg);
+            }
+            SettingsAction::SetLyricTranslation(on) => {
+                // 互斥单选（阶段 24）：开译文就关罗马音；关译文只关自己。
+                // 状态计算全走 `exclusive_gloss`，不在这里另写一份 if。
+                let (t, r) = super::settings::exclusive_gloss(
+                    self.lyric_translation,
+                    self.lyric_roman,
+                    super::settings::GlossKind::Translation,
+                );
+                // UI 传的是「点击后的期望值」，必须与互斥计算一致（不一致就是
+                // 有人接了别的入口却没走这套规则，debug 下立刻炸出来）
+                debug_assert_eq!(on, t, "SetLyricTranslation 与互斥规则不一致");
+                self.lyric_translation = t;
+                self.lyric_roman = r;
+                self.persist_prefs();
+                let msg = if t {
+                    self.t("歌词译文已开启", "Lyric translation on")
+                } else {
+                    self.t("歌词译文已关闭", "Lyric translation off")
+                };
+                self.push_toast(msg);
+            }
+            SettingsAction::SetLyricRoman(on) => {
+                let (t, r) = super::settings::exclusive_gloss(
+                    self.lyric_translation,
+                    self.lyric_roman,
+                    super::settings::GlossKind::Roman,
+                );
+                debug_assert_eq!(on, r, "SetLyricRoman 与互斥规则不一致");
+                self.lyric_translation = t;
+                self.lyric_roman = r;
+                self.persist_prefs();
+                let msg = if r {
+                    self.t("罗马音已开启", "Romaji on")
+                } else {
+                    self.t("罗马音已关闭", "Romaji off")
+                };
                 self.push_toast(msg);
             }
             SettingsAction::SetMediaKeys(on) => {
@@ -6246,10 +6687,18 @@ impl ReimuApp {
                     "SEARCH / 输入关键词，或粘贴网易云分享链接…",
                     "SEARCH / keyword, or paste a NetEase share link…",
                 );
+                // 右键菜单的文案也要在借 `search_input` 之前取（`t` 只借 self）
+                let paste_label = self.t("粘贴", "PASTE");
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.search_input)
                         .hint_text(hint)
                         .desired_width(ui.available_width() - 190.0),
+                );
+                // Ctrl+V 走 `inject_paste`；右键菜单这条路 egui 不自带，得自己挂
+                super::clipboard::attach_paste_menu(
+                    &response,
+                    paste_label,
+                    &mut self.search_input,
                 );
                 if self.focus_search {
                     response.request_focus();
@@ -6599,29 +7048,54 @@ impl ReimuApp {
         if reset_scroll {
             area = area.vertical_scroll_offset(0.0);
         }
-        area.show(ui, |ui| {
-            for (index, track) in self.current_tracks().iter().enumerate() {
-                let view = ResRow {
-                    index,
-                    title: &track.title,
-                    artist: &track.artists.join(" / "),
-                    time: &track.duration_text(),
-                    current: current_id.as_deref() == Some(track.id.as_str()),
-                    selected: self.selected == Some(index),
-                    favorite: self.favorites.contains(track),
-                    highlight: &self.highlight_query,
-                };
-                match widgets::res_row(ui, ui.scope_id().with(("res-row", index)), &view) {
-                    RowAction::None => {}
-                    other => {
-                        action = Some(other);
-                        action_index = index;
+        // 虚拟化：歌单分页后单页 200 行、整单可达上万行，逐帧全量布局会掉帧。
+        // `show_rows` 只对可视区间内的行调用 `res_row`，行高取公共常量
+        // [`widgets::RES_ROW_HEIGHT`]（与 `res_row` 的实际绘制高度同源）。
+        let total_rows = self.current_tracks().len();
+        let out = area.show_rows(
+            ui,
+            widgets::RES_ROW_HEIGHT,
+            total_rows,
+            |ui, range: std::ops::Range<usize>| {
+                for index in range {
+                    let Some(track) = self.current_tracks().get(index) else {
+                        continue;
+                    };
+                    let view = ResRow {
+                        index,
+                        title: &track.title,
+                        artist: &track.artists.join(" / "),
+                        time: &track.duration_text(),
+                        current: current_id.as_deref() == Some(track.id.as_str()),
+                        selected: self.selected == Some(index),
+                        favorite: self.favorites.contains(track),
+                        highlight: &self.highlight_query,
+                    };
+                    match widgets::res_row(ui, ui.scope_id().with(("res-row", index)), &view) {
+                        RowAction::None => {}
+                        other => {
+                            action = Some(other);
+                            action_index = index;
+                        }
                     }
                 }
-            }
-        });
+            },
+        );
         if let Some(action) = action {
             self.apply_row_action(action, action_index);
+        }
+        // 滚到底自动续取：9826 首的歌单靠手点「加载更多」要 49 次，实际上没人会点。
+        // 只对**可续取的在线歌单**生效（收藏/最近播放/本地曲库不是分页数据），
+        // 且要求内容确实超出视口——否则短列表一进来就无限续取。
+        if self.playlist_more_visible()
+            && self.playlist_more_seq == 0
+            && near_list_bottom(
+                out.content_size.y,
+                out.state.clamped_offset().y,
+                out.inner_rect.height(),
+            )
+        {
+            self.load_more_playlist(true);
         }
     }
 
@@ -6666,8 +7140,58 @@ impl ReimuApp {
             false,
             true,
         );
+        // 副标题是用 `paint_spec_text` 画的（不推进 cursor），这 14px 就是它的
+        // 占位高度。按钮行必须排在它之后，否则会盖住歌单名与曲目数。
         ui.add_space(14.0);
-
+        // 整单播放入口：推荐卡 / 榜单行点开后能直接听整张，不必先点某一首。
+        // 与歌单页那一行同构（▶ 主色 + ⇄ 次色），右侧顺带显示「已取 / 共」，
+        // 让"只加载了一部分"这件事在界面上可见。
+        let mut row_hit = PeekHit::None;
+        if let Some(list) = peek.state.get() {
+            ui.horizontal(|ui| {
+                if widgets::text_button(
+                    ui,
+                    ui.scope_id().with(("btn-peek-play", panel.scroll_salt())),
+                    self.t("▶ 播放全部", "▶ PLAY ALL"),
+                    true,
+                    false,
+                )
+                .clicked()
+                {
+                    row_hit = PeekHit::PlayAll;
+                }
+                ui.add_space(8.0);
+                if widgets::text_button(
+                    ui,
+                    ui.scope_id()
+                        .with(("btn-peek-shuffle", panel.scroll_salt())),
+                    self.t("⇄ 随机播放全部", "⇄ SHUFFLE ALL"),
+                    false,
+                    false,
+                )
+                .clicked()
+                {
+                    row_hit = PeekHit::ShuffleAll;
+                }
+                if let Some(total) = list.total {
+                    let text = format!("{} / {}", list.tracks.len(), total);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(widgets::spec_job(
+                            &text,
+                            FONT_TINY,
+                            TRACKING_TINY,
+                            pal().mid,
+                            true,
+                        ));
+                    });
+                }
+            });
+            ui.add_space(10.0);
+        }
+        // 同一帧既点「返回」又点播放属于误触：返回优先
+        if row_hit != PeekHit::None && hit == PeekHit::None {
+            hit = row_hit;
+        }
         let tracks: &[Track] = match &peek.state {
             LoadState::Ready(list) => &list.tracks,
             _ => &[],
@@ -6725,7 +7249,11 @@ impl ReimuApp {
         let accents = [pal().blue, pal().pink, pal().ink, pal().acid, pal().mid];
         let current_id = self.core.now_playing().map(|n| n.id.clone());
         let mut clicked: Option<usize> = None;
-        egui::ScrollArea::vertical()
+        let more_label = self.t("↓ 加载更多", "↓ LOAD MORE");
+        let has_more = peek.has_more;
+        let more_busy = peek.more_seq != 0;
+        let mut more_clicked = false;
+        let out = egui::ScrollArea::vertical()
             .id_salt(panel.scroll_salt())
             .max_height(ui.available_height())
             .auto_shrink([false, true])
@@ -6746,7 +7274,36 @@ impl ReimuApp {
                         ui.add_space(GAP_SPINE);
                     }
                 }
+                // 续取入口跟着列表走：滚到底才看得到，不占顶部空间
+                if has_more {
+                    ui.add_space(10.0);
+                    if widgets::text_button(
+                        ui,
+                        ui.scope_id().with(("btn-peek-more", panel.scroll_salt())),
+                        if more_busy { "…" } else { more_label },
+                        false,
+                        more_busy,
+                    )
+                    .clicked()
+                    {
+                        more_clicked = true;
+                    }
+                }
             });
+        if more_clicked {
+            hit = PeekHit::LoadMore;
+        } else if has_more
+            && !more_busy
+            && near_list_bottom(
+                out.content_size.y,
+                out.state.clamped_offset().y,
+                out.inner_rect.height(),
+            )
+        {
+            // 滚到底自动续取（与歌单页同一条阈值）：千首以上的歌单不必手点。
+            // 判定用本帧的滚动状态——`.show()` 返回时状态已更新。
+            hit = PeekHit::LoadMore;
+        }
         if let Some(index) = clicked {
             hit = match hit {
                 // 同一帧既点返回又点曲目属于误触：返回优先
@@ -6776,6 +7333,9 @@ impl ReimuApp {
                     match self.ui_playlist_peek(ui, PeekPanel::Rec) {
                         PeekHit::Back => self.close_peek(PeekPanel::Rec),
                         PeekHit::Play(index) => self.play_peek_track(PeekPanel::Rec, index),
+                        PeekHit::PlayAll => self.play_peek_all(PeekPanel::Rec, false),
+                        PeekHit::ShuffleAll => self.play_peek_all(PeekPanel::Rec, true),
+                        PeekHit::LoadMore => self.load_more_peek(PeekPanel::Rec),
                         PeekHit::None => {}
                     }
                     return;
@@ -6905,6 +7465,9 @@ impl ReimuApp {
                     match self.ui_playlist_peek(ui, PeekPanel::Chart) {
                         PeekHit::Back => self.close_peek(PeekPanel::Chart),
                         PeekHit::Play(index) => self.play_peek_track(PeekPanel::Chart, index),
+                        PeekHit::PlayAll => self.play_peek_all(PeekPanel::Chart, false),
+                        PeekHit::ShuffleAll => self.play_peek_all(PeekPanel::Chart, true),
+                        PeekHit::LoadMore => self.load_more_peek(PeekPanel::Chart),
                         PeekHit::None => {}
                     }
                     return;
@@ -7098,8 +7661,15 @@ impl ReimuApp {
             let frame = self.frame_u64();
             let (badge_text, badge_color) =
                 widgets::badge_view(&self.daily_state, frame, self.lang);
+            // 播放入口与「重载」分列两端：左边是"拿这批去听"，右边是"重新拉一批"，
+            // 语义不同不该挤在一起。
+            let mut daily_play: Option<bool> = None;
             ui.horizontal(|ui| {
                 widgets::load_badge(ui, &badge_text, badge_color);
+                ui.add_space(10.0);
+                if let Some(shuffle) = self.daily_play_row(ui, tracks.is_empty()) {
+                    daily_play = Some(shuffle);
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if widgets::text_button(
                         ui,
@@ -7114,6 +7684,9 @@ impl ReimuApp {
                     }
                 });
             });
+            if let Some(shuffle) = daily_play {
+                self.play_daily_all(shuffle);
+            }
             // 日期行：既回答"这是哪一天的推荐"，也是跨天自动刷新的可见证据
             widgets::paint_spec_text(
                 ui,
@@ -7151,6 +7724,16 @@ impl ReimuApp {
                         false,
                         true,
                     );
+                    ui.add_space(10.0);
+                    // 离线批次同样给整单播放入口：它虽然是降级内容，但用户
+                    // 看到的就是"今日推荐"，没有理由不能整批听。
+                    let mut offline_play: Option<bool> = None;
+                    ui.horizontal(|ui| {
+                        offline_play = self.daily_play_row(ui, false);
+                    });
+                    if let Some(shuffle) = offline_play {
+                        self.play_daily_offline_all(shuffle);
+                    }
                     ui.add_space(14.0);
                     let h = ui.available_height();
                     self.ui_offline_daily(ui, h);
@@ -7279,6 +7862,95 @@ impl ReimuApp {
                 }
             });
         });
+    }
+
+    /// 每日推荐的整单播放入口（在线列表与离线兜底共用同一行）。
+    ///
+    /// 返回 `Some(shuffle)` 表示用户点了播放：`false` = 顺序，`true` = 随机。
+    /// `empty` 为真时按钮**保留但禁用**——直接不画会让用户以为"这个页面
+    /// 没有整单播放功能"，而加载中/需要登录时按钮本就在。
+    ///
+    /// 调用方负责把它放进一个 `ui.horizontal`：这里不自开横向布局，
+    /// 因为外层已经在横排里（自开一层会吃掉剩余宽度，把「重载」挤出面板）。
+    fn daily_play_row(&self, ui: &mut Ui, empty: bool) -> Option<bool> {
+        let mut hit = None;
+        if widgets::text_button(
+            ui,
+            ui.scope_id().with("btn-daily-play"),
+            self.t("▶ 播放全部", "▶ PLAY ALL"),
+            true,
+            empty,
+        )
+        .clicked()
+        {
+            hit = Some(false);
+        }
+        ui.add_space(6.0);
+        if widgets::text_button(
+            ui,
+            ui.scope_id().with("btn-daily-shuffle"),
+            self.t("⇄ 随机播放全部", "⇄ SHUFFLE ALL"),
+            false,
+            empty,
+        )
+        .clicked()
+        {
+            hit = Some(true);
+        }
+        hit
+    }
+
+    /// 用一批曲目**替换**磁带架与播放队列，并立刻开播。
+    ///
+    /// 顺序不能反：`replace_queue` 会作废洗牌序列，必须先换队列再
+    /// `set_play_mode(Shuffle)`；反过来做，新队列会沿用旧的随机序列，
+    /// 第一首就不是随机的。
+    ///
+    /// 不走 `play_selected`：那条路会再 `adopt_queue` 一次，按当前浏览列表
+    /// 重建队列，刚建好的这批就被冲掉了。
+    fn play_batch(&mut self, tracks: Vec<Track>, shuffle: bool, label: &str) {
+        if tracks.is_empty() {
+            self.push_toast(self.t(
+                "这批曲子暂时不能播放",
+                "Nothing playable in this batch",
+            ));
+            return;
+        }
+        self.selected = Some(0);
+        self.replace_queue(tracks);
+        if shuffle {
+            self.core.set_play_mode(PlayMode::Shuffle);
+            self.shuffle_order = None;
+        }
+        if let Some(first) = self.queue.first().cloned() {
+            self.play_track(first);
+        }
+        let mode = self.play_mode_label(self.core.play_mode());
+        let count = self.queue.len();
+        self.push_toast(self.t(
+            &format!("{label} · {mode} · {count} 首"),
+            &format!("{label} · {mode} · {count} tracks"),
+        ));
+    }
+
+    /// 每日推荐整单播放（在线批次）。
+    fn play_daily_all(&mut self, shuffle: bool) {
+        let Some(tracks) = self.daily_state.get().cloned() else {
+            return;
+        };
+        self.clear_user_view();
+        self.active_local = false;
+        self.active_playlist = None;
+        self.play_batch(tracks, shuffle, self.t("每日推荐", "DAILY"));
+    }
+
+    /// 离线兜底的整单播放：数据来自本地曲库，不触网。
+    fn play_daily_offline_all(&mut self, shuffle: bool) {
+        let tracks = self.daily_local.clone();
+        self.clear_user_view();
+        self.active_local = false;
+        self.active_playlist = None;
+        self.play_batch(tracks, shuffle, self.t("离线推荐", "OFFLINE"));
     }
 
     /// 以「当天推荐批次」为队列播放第 `index` 首。
@@ -7576,10 +8248,16 @@ impl ReimuApp {
                 if self.rename_target == Some(id) {
                     ui.horizontal(|ui| {
                         let hint = self.t("新名称", "New name");
-                        ui.add(
+                        let paste_label = self.t("粘贴", "PASTE");
+                        let rename_edit = ui.add(
                             egui::TextEdit::singleline(&mut self.rename_input)
                                 .hint_text(hint)
                                 .desired_width(ui.available_width() - 130.0),
+                        );
+                        super::clipboard::attach_paste_menu(
+                            &rename_edit,
+                            paste_label,
+                            &mut self.rename_input,
                         );
                         let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                         if widgets::text_button(
@@ -7810,10 +8488,16 @@ impl ReimuApp {
                         "歌单 ID / 分享链接，如 24381616",
                         "Playlist ID / share link, e.g. 24381616",
                     );
-                    ui.add(
+                    let paste_label = self.t("粘贴", "PASTE");
+                    let pl_edit = ui.add(
                         egui::TextEdit::singleline(&mut self.playlist_input)
                             .hint_text(hint)
                             .desired_width(ui.available_width() - 90.0),
+                    );
+                    super::clipboard::attach_paste_menu(
+                        &pl_edit,
+                        paste_label,
+                        &mut self.playlist_input,
                     );
                     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if widgets::text_button(
@@ -7959,10 +8643,16 @@ impl ReimuApp {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     let hint = self.t("新歌单名称", "New playlist name");
-                    ui.add(
+                    let paste_label = self.t("粘贴", "PASTE");
+                    let new_pl_edit = ui.add(
                         egui::TextEdit::singleline(&mut self.new_playlist_name)
                             .hint_text(hint)
                             .desired_width(ui.available_width() - 74.0),
+                    );
+                    super::clipboard::attach_paste_menu(
+                        &new_pl_edit,
+                        paste_label,
+                        &mut self.new_playlist_name,
                     );
                     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if widgets::text_button(
@@ -8090,14 +8780,22 @@ impl ReimuApp {
                     match self.active_playlist.and_then(|i| self.playlists.get(i)) {
                         Some(p) => {
                             let total_ms: u64 = p.tracks.iter().filter_map(|t| t.duration_ms).sum();
+                            // 计数按接口 `total`（真实总数）显示「已取 / 共」，
+                            // 否则一张 500 首的歌单会写成「30 盘」，用户以为歌单只有 30 首。
+                            let shown = p.tracks.len();
+                            let count = match p.total {
+                                Some(total) if total > shown as u64 => {
+                                    format!("{:02}/{total} {}", shown, self.t("盘", "TAPES"))
+                                }
+                                _ => format!("{:02} {}", shown, self.t("盘", "TAPES")),
+                            };
                             (
                                 p.name.clone().unwrap_or_else(|| {
                                     self.t("未命名混音", "UNTITLED MIX").to_string()
                                 }),
                                 format!(
-                                    "{:02} {} · {}",
-                                    p.tracks.len(),
-                                    self.t("盘", "TAPES"),
+                                    "{} · {}",
+                                    count,
                                     format_duration(Duration::from_millis(total_ms))
                                 ),
                             )
@@ -8134,7 +8832,7 @@ impl ReimuApp {
                     if widgets::text_button(
                         ui,
                         ui.scope_id().with("btn-pl-shuffle"),
-                        self.t("⇄ 随机播放", "⇄ SHUFFLE"),
+                        self.t("⇄ 随机播放全部", "⇄ SHUFFLE ALL"),
                         false,
                         false,
                     )
@@ -8144,6 +8842,12 @@ impl ReimuApp {
                         if len == 0 {
                             self.push_toast(self.t("这盒磁带是空的", "THIS CASE IS EMPTY"));
                         } else {
+                            // 真正切到随机档：原来只随机挑一个起点，下一首仍按当前
+                            // 模式顺序走，按钮名字说随机、行为却不是随机。
+                            // `play_selected` → `adopt_queue` 会作废洗牌序列，
+                            // 之后 `ensure_shuffle_order` 按新列表重洗。
+                            self.core.set_play_mode(PlayMode::Shuffle);
+                            self.shuffle_order = None;
                             let seed = widgets::hash_id(&format!("shuf{}", self.t as u64));
                             self.selected = Some(seed as usize % len);
                             self.play_selected();
@@ -8156,7 +8860,29 @@ impl ReimuApp {
                 // 本地曲库工具条（扫描文件夹 → 入库成持久化歌单）
                 self.ui_library_toolbar(ui);
                 ui.add_space(10.0);
-                self.ui_result_rows(ui, ui.available_height());
+                // 「加载更多」固定在列表下方：列表吃掉剩余高度，按钮不被顶出面板
+                let more_visible = self.playlist_more_visible();
+                let more_h = if more_visible { 38.0 } else { 0.0 };
+                self.ui_result_rows(ui, (ui.available_height() - more_h).max(60.0));
+                if more_visible {
+                    let busy = self.playlist_more_seq != 0;
+                    let label = if busy {
+                        self.t("加载中…", "LOADING…")
+                    } else {
+                        self.t("↓ 加载更多", "↓ LOAD MORE")
+                    };
+                    if widgets::text_button(
+                        ui,
+                        ui.scope_id().with("btn-pl-more"),
+                        label,
+                        false,
+                        busy,
+                    )
+                    .clicked()
+                    {
+                        self.load_more_playlist(false);
+                    }
+                }
             });
         });
     }
@@ -8385,6 +9111,16 @@ impl eframe::App for ReimuApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 粘贴：eframe 没启用 `clipboard` feature（不引入 arboard，见
+        // `gui::clipboard`），egui-winit 因此从不产生 `Event::Paste`，
+        // 所有 `TextEdit` 的 Ctrl+V 都拿不到东西。这里自己读一次系统剪贴板，
+        // 再走 egui 的标准事件通道——光标位置、选区替换、单行过滤仍由
+        // `TextEdit` 自己处理，控件层面不用改。
+        //
+        // 每帧**只在这里**注入一次：若分散到各个输入框之前调用，
+        // `key_pressed` 不消费按键，同一帧多个输入框会各注入一份 → 粘贴多遍。
+        inject_paste(ui);
+
         // 纸底：`clear_color` 已改为全透明（为了歌词窗四角真透明），主窗口
         // 必须自己铺满整块视口，否则未绘制区域会漏出桌面/黑底。
         // 放在最前面画 = 压在所有内容之下（egui 按绘制调用顺序叠加）。
@@ -8910,6 +9646,58 @@ mod tests {
     }
 
     #[test]
+    fn the_first_shuffle_is_not_the_shelf_order() {
+        // 回归：`shuffle_seed` 初值恰好等于 PRNG 常量 → `rng == 0` 是 xorshift64
+        // 的不动点 → Fisher-Yates 退化成 `swap(i, 0)` → 排列恒为
+        // `[1,2,…,n-1,0]`，也就是**磁带架顺序右移一位**。
+        // 用户看到的现象：随机档点 ⏭ 却按磁带架顺序走（自然播完那次序列已重建，
+        // 种子推进后才是真随机，于是"两种场景行为不一致"）。
+        let mut app = test_app();
+        app.active_local = false;
+        app.active_playlist = None;
+        let n = 6usize;
+        let tracks: Vec<Track> = (0..n).map(|i| sample_track(&i.to_string())).collect();
+        app.search_state.finish(Ok(tracks));
+        app.core.shuffle = true;
+        app.selected = Some(0);
+
+        app.ensure_shuffle_order();
+        let order = app.shuffle_order.clone().expect("应有洗牌序列");
+
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..n).collect::<Vec<_>>(), "洗牌结果必须是排列");
+        assert_ne!(order, (0..n).collect::<Vec<_>>(), "首建不得等于磁带架顺序");
+        assert_ne!(
+            order,
+            vec![1, 2, 3, 4, 5, 0],
+            "首建不得退化成磁带架顺序右移一位（rng 落 0 的症状）"
+        );
+    }
+
+    #[test]
+    fn rebuilding_the_shuffle_produces_a_different_order() {
+        // 种子单调递增 → 连续两次重建必须不同；相同就说明 PRNG 没真的动起来
+        let mut app = test_app();
+        app.active_local = false;
+        app.active_playlist = None;
+        let n = 6usize;
+        let tracks: Vec<Track> = (0..n).map(|i| sample_track(&i.to_string())).collect();
+        app.search_state.finish(Ok(tracks));
+        app.core.shuffle = true;
+        app.selected = Some(0);
+
+        app.ensure_shuffle_order();
+        let first = app.shuffle_order.clone().expect("应有洗牌序列");
+        // 作废后重洗（列表没变，但强制重建）
+        app.shuffle_order = None;
+        app.ensure_shuffle_order();
+        let second = app.shuffle_order.clone().expect("应有洗牌序列");
+
+        assert_ne!(first, second, "两次重建的排列必须不同");
+    }
+
+    #[test]
     fn mode_key_cycles_the_four_modes_in_order() {
         // 左键照播放键的交互：点一下走一档，八次点击正好两圈，不会停在中间态或跳档
         let mut app = test_app();
@@ -9388,6 +10176,9 @@ mod tests {
             subtitle: "推荐歌单".into(),
             seq: 1,
             state: LoadState::Ready(list),
+            offset: 2,
+            has_more: false,
+            more_seq: 0,
             expanded: true,
         });
         // 先让磁带架上有一份别的列表
@@ -9400,6 +10191,303 @@ mod tests {
         assert_eq!(shelf, vec!["x", "y"], "磁带架必须换成这张歌单");
         assert_eq!(app.queue.len(), 2, "队列与磁带架同一份内容");
         assert_eq!(app.selected, Some(1), "选中就是刚点的那首");
+    }
+
+    /// 推荐/榜单详情的「播放全部」：替换磁带架与队列，从第一首开始。
+    #[test]
+    fn play_peek_all_replaces_the_queue_with_the_peek_list() {
+        let mut app = test_app();
+        let list = crate::music::provider::Playlist {
+            provider: crate::music::provider::ProviderId::Netease,
+            id: "6001".into(),
+            name: Some("整单".into()),
+            total: Some(3),
+            tracks: vec![sample_track("x"), sample_track("y"), sample_track("z")],
+        };
+        app.rec_peek = Some(PlaylistPeek {
+            id: list.id.clone(),
+            subtitle: "整单".into(),
+            seq: 1,
+            state: LoadState::Ready(list),
+            offset: 3,
+            has_more: false,
+            more_seq: 0,
+            expanded: true,
+        });
+        app.search_state.finish(Ok(vec![sample_track("old")]));
+        app.active_local = false;
+
+        app.play_peek_all(PeekPanel::Rec, false);
+
+        let queue: Vec<&str> = app.queue.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(queue, vec!["x", "y", "z"], "队列应换成整张歌单");
+        let shelf: Vec<&str> = app.current_tracks().iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(shelf, queue, "磁带架与队列必须是同一份");
+        assert_eq!(app.selected, Some(0), "播放全部从第一首开始");
+        assert_eq!(
+            app.core.play_mode(),
+            PlayMode::Sequential,
+            "非随机入口不该动档位"
+        );
+    }
+
+    /// 「随机播放全部」必须真的切到随机档，而不只是换个起点。
+    #[test]
+    fn shuffle_all_switches_the_play_mode() {
+        let mut app = test_app();
+        let list = crate::music::provider::Playlist {
+            provider: crate::music::provider::ProviderId::Netease,
+            id: "6002".into(),
+            name: Some("整单".into()),
+            total: Some(4),
+            tracks: (0..4).map(|i| sample_track(&i.to_string())).collect(),
+        };
+        app.rec_peek = Some(PlaylistPeek {
+            id: list.id.clone(),
+            subtitle: "整单".into(),
+            seq: 1,
+            state: LoadState::Ready(list),
+            offset: 4,
+            has_more: false,
+            more_seq: 0,
+            expanded: true,
+        });
+        app.active_local = false;
+        assert_eq!(app.core.play_mode(), PlayMode::Sequential);
+
+        app.play_peek_all(PeekPanel::Rec, true);
+
+        assert_eq!(
+            app.core.play_mode(),
+            PlayMode::Shuffle,
+            "随机播放全部必须切到随机档"
+        );
+        assert!(app.shuffle_order.is_none(), "换了列表，洗牌序列要重洗");
+        assert_eq!(app.queue.len(), 4);
+    }
+
+    // ------------------------------------------------------------------
+    // 每日推荐的整单播放
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn daily_play_all_replaces_the_shelf_and_the_queue() {
+        let mut app = test_app();
+        app.daily_state
+            .finish(Ok(vec![sample_track("d0"), sample_track("d1"), sample_track("d2")]));
+        // 先让磁带架停在一份无关内容上，确认整单播放会把它换掉
+        app.search_state.finish(Ok(vec![sample_track("old")]));
+        app.active_local = false;
+
+        app.play_daily_all(false);
+
+        let queue: Vec<&str> = app.queue.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(queue, vec!["d0", "d1", "d2"], "队列应换成当天这批");
+        // 磁带架不跟着换：`current_tracks()` 兼作"浏览列表"与"播放队列"，
+        // 每日推荐没有歌单实体可挂（`active_playlist = None`），落回检索结果。
+        // 这是既有架构问题（见 `docs/INTERACTION_AUDIT.md`），不在本次范围内；
+        // 用户侧的反馈是 toast + 实际出声，行为与点单曲 `play_daily_index` 一致。
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(
+            app.core.play_mode(),
+            PlayMode::Sequential,
+            "非随机入口不该动档位"
+        );
+    }
+
+    #[test]
+    fn daily_shuffle_all_switches_the_play_mode() {
+        let mut app = test_app();
+        app.daily_state
+            .finish(Ok((0..5).map(|i| sample_track(&i.to_string())).collect()));
+        app.active_local = false;
+
+        app.play_daily_all(true);
+
+        assert_eq!(app.core.play_mode(), PlayMode::Shuffle);
+        assert!(app.shuffle_order.is_none(), "换了列表，洗牌序列要重洗");
+        assert_eq!(app.queue.len(), 5);
+    }
+
+    #[test]
+    fn daily_offline_play_all_uses_the_local_batch() {
+        // 离线兜底是另一条数据源（`daily_local`），不能被在线批次串掉
+        let mut app = test_app();
+        app.daily_local = vec![sample_track("l0"), sample_track("l1")];
+        app.daily_state
+            .finish(Ok(vec![sample_track("online")]));
+        app.active_local = false;
+
+        app.play_daily_offline_all(false);
+
+        let queue: Vec<&str> = app.queue.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(queue, vec!["l0", "l1"], "离线入口必须播本地那批");
+    }
+
+    #[test]
+    fn play_batch_refuses_an_empty_batch() {
+        // 空批次不能把正在播的队列清掉：按钮是禁用的，但状态竞争仍可能到这
+        let mut app = test_app();
+        app.replace_queue(vec![sample_track("keep")]);
+        app.play_batch(Vec::new(), false, "空");
+        let queue: Vec<&str> = app.queue.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(queue, vec!["keep"], "空批次不得清空队列");
+    }
+
+    // ------------------------------------------------------------------
+    // 歌单分页（「加载更多」）
+    // ------------------------------------------------------------------
+
+    fn paged_playlist(id: &str, taken: usize, total: u64) -> crate::music::provider::Playlist {
+        crate::music::provider::Playlist {
+            provider: crate::music::provider::ProviderId::Netease,
+            id: id.into(),
+            name: Some(format!("分页 {id}")),
+            total: Some(total),
+            tracks: (0..taken)
+                .map(|i| sample_track(&format!("{id}-{i}")))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn page_has_more_follows_the_provider_total() {
+        // 判据是接口给的真实总数，不是已取条数——否则永远"还有更多"
+        let mut p = paged_playlist("p", 50, 120);
+        assert!(page_has_more(&p), "50 / 120 应还有更多");
+        p = paged_playlist("p", 120, 120);
+        assert!(!page_has_more(&p), "取满即到底");
+        p = paged_playlist("p", 50, 120);
+        p.total = None;
+        assert!(!page_has_more(&p), "总数缺失时不能无限续取");
+    }
+
+    #[test]
+    fn merge_playlist_page_appends_and_dedupes_the_overlap() {
+        let base = paged_playlist("p", 2, 4);
+        let page = crate::music::provider::Playlist {
+            provider: crate::music::provider::ProviderId::Netease,
+            id: "p".into(),
+            name: None,
+            total: Some(4),
+            // 分页边界重叠：第 1 条与上一页末尾同 ID
+            tracks: vec![sample_track("p-1"), sample_track("p-2")],
+        };
+        let merged = merge_playlist_page(Some(base), page);
+        let ids: Vec<&str> = merged.tracks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["p-0", "p-1", "p-2"], "重叠项不得重复入列");
+        assert_eq!(merged.total, Some(4));
+    }
+
+    #[test]
+    fn merge_playlist_page_refuses_to_mix_two_playlists() {
+        // 期间换了歌单：以新页为准，串数据比丢一页更糟
+        let base = paged_playlist("old", 2, 4);
+        let page = paged_playlist("new", 2, 4);
+        let merged = merge_playlist_page(Some(base), page);
+        assert_eq!(merged.id, "new");
+        assert_eq!(merged.tracks.len(), 2);
+    }
+
+    #[test]
+    fn load_more_requests_the_next_offset() {
+        let mut app = test_app();
+        let idx = app.remember_loaded_playlist(paged_playlist("p", 50, 120));
+        app.active_playlist = Some(idx);
+        app.playlist_has_more = true;
+
+        app.load_more_playlist(false);
+
+        assert!(app.playlist_more_seq > 0, "应派发续取请求");
+        assert_eq!(app.playlist_offset, 50, "offset 必须接在已取条数之后");
+        // 再点一次不得叠请求
+        let seq = app.playlist_more_seq;
+        app.load_more_playlist(false);
+        assert_eq!(app.playlist_more_seq, seq, "在途时不得重复派发");
+    }
+
+    #[test]
+    fn manual_and_automatic_load_more_are_told_apart() {
+        // 自动续取一屏能连发几十次，靠这个标记把 toast 静音
+        let mut app = test_app();
+        let idx = app.remember_loaded_playlist(paged_playlist("p", 50, 120));
+        app.active_playlist = Some(idx);
+        app.playlist_has_more = true;
+
+        app.load_more_playlist(false);
+        assert!(!app.playlist_more_auto, "手动点击不该被标成自动");
+
+        // 模拟上一笔已回来
+        app.playlist_more_seq = 0;
+        app.load_more_playlist(true);
+        assert!(app.playlist_more_auto, "滚到底触发的必须标成自动");
+    }
+
+    #[test]
+    fn page_sizes_stay_inside_the_provider_ceiling() {
+        // Provider 的 `MAX_PLAYLIST_LIMIT` 是 200，页大小超了会被静默截断，
+        // 于是"已取 / 共"的进度会与实际取到的条数对不上。
+        assert_eq!(PLAYLIST_PAGE, 200);
+        // peek 用 spine 列表、没有虚拟化，页大小必须比歌单页小，否则压帧
+        assert!(PEEK_PAGE < PLAYLIST_PAGE);
+        // 自动续取的提前量要小于一页的高度，否则一进列表就触发
+        assert!(
+            AUTO_LOAD_MORE_GAP < widgets::RES_ROW_HEIGHT * PLAYLIST_PAGE as f32,
+            "提前量必须远小于整页高度"
+        );
+    }
+
+    #[test]
+    fn near_list_bottom_needs_a_scrollable_list() {
+        // 内容比视口还短：即便"已在底部"也不能触发，否则一进列表就把整个
+        // 9826 首的歌单连拉 49 次
+        assert!(!near_list_bottom(300.0, 0.0, 500.0), "装得下就不续取");
+        assert!(!near_list_bottom(500.0, 0.0, 500.0), "刚好装下也不续取");
+    }
+
+    #[test]
+    fn near_list_bottom_triggers_only_near_the_end() {
+        // 6800px 内容 / 500px 视口：滚到 0 时还剩 6300，不该续取
+        assert!(!near_list_bottom(6800.0, 0.0, 500.0));
+        // 滚到还剩 100px 时该续取
+        assert!(near_list_bottom(6800.0, 6200.0, 500.0));
+        // 完全到底也要续取（`clamped_offset` 会停在这里）
+        assert!(near_list_bottom(6800.0, 6300.0, 500.0));
+        // 提前量边界：剩余正好等于阈值时不触发（严格小于）
+        assert!(!near_list_bottom(
+            6800.0,
+            6800.0 - 500.0 - AUTO_LOAD_MORE_GAP,
+            500.0
+        ));
+    }
+
+    #[test]
+    fn load_more_is_a_noop_without_more_pages() {
+        let mut app = test_app();
+        let idx = app.remember_loaded_playlist(paged_playlist("p", 120, 120));
+        app.active_playlist = Some(idx);
+        app.playlist_has_more = false;
+
+        app.load_more_playlist(false);
+
+        assert_eq!(app.playlist_more_seq, 0, "到底了就不该再发请求");
+    }
+
+    #[test]
+    fn the_more_button_only_shows_for_an_online_playlist() {
+        // `playlist_has_more` 是全局标记，但右栏也会显示收藏/本地曲库
+        let mut app = test_app();
+        let idx = app.remember_loaded_playlist(paged_playlist("p", 50, 120));
+        app.active_playlist = Some(idx);
+        app.playlist_has_more = true;
+        assert!(app.playlist_more_visible());
+
+        app.active_local = true;
+        assert!(!app.playlist_more_visible(), "本地曲库不分页");
+        app.active_local = false;
+
+        app.user_view = UserView::Favorites;
+        assert!(!app.playlist_more_visible(), "收藏视图不分页");
     }
 
     #[test]
@@ -9629,6 +10717,55 @@ mod tests {
         );
         let (msg, _) = app.toast.clone().expect("切换样式应给提示");
         assert!(msg.contains("进度条"), "toast 应说明改的是进度条: {msg}");
+    }
+
+    #[test]
+    fn settings_action_toggles_the_aux_lyric_tracks() {
+        // 两个开关必须真的落到 app 状态上：渲染层（主窗口 + 桌面歌词）读的就是
+        // 这两个字段，只改面板显示不改状态等于没接线。
+        let mut app = test_app();
+        assert!(!app.lyric_translation, "默认关闭");
+        assert!(!app.lyric_roman, "默认关闭");
+
+        app.apply_settings_action(SettingsAction::SetLyricTranslation(true));
+        assert!(app.lyric_translation);
+        assert!(app.settings_view().lyric_translation, "面板要看到已开启");
+        assert!(app.prefs_snapshot().lyric_translation, "必须能落盘");
+
+        // 阶段 24：两个开关**互斥**。开罗马音必须顺手把译文关掉。
+        app.apply_settings_action(SettingsAction::SetLyricRoman(true));
+        assert!(app.lyric_roman);
+        assert!(!app.lyric_translation, "开罗马音必须关掉译文");
+        assert!(app.settings_view().lyric_roman);
+        assert!(app.prefs_snapshot().lyric_roman);
+        assert!(!app.prefs_snapshot().lyric_translation, "落盘也必须互斥");
+
+        // 再点自己 → 两个都关（否则回不到"不要辅助行"这个状态）
+        app.apply_settings_action(SettingsAction::SetLyricRoman(false));
+        assert!(!app.lyric_translation && !app.lyric_roman);
+        assert!(!app.prefs_snapshot().lyric_translation);
+        assert!(!app.prefs_snapshot().lyric_roman);
+
+        // 反方向：罗马音开着时开译文，罗马音必须被关掉
+        app.apply_settings_action(SettingsAction::SetLyricRoman(true));
+        app.apply_settings_action(SettingsAction::SetLyricTranslation(true));
+        assert!(app.lyric_translation);
+        assert!(!app.lyric_roman, "开译文必须关掉罗马音");
+    }
+
+    #[test]
+    fn aux_switches_off_means_no_aux_line_anywhere() {
+        // 关闭态是回归基线：两个开关都关时，歌词行与桌面歌词帧都不许带辅助行。
+        let app = test_app();
+        assert!(!app.lyric_translation && !app.lyric_roman);
+        let lyrics = crate::music::lyrics::parse_lrc("[00:01.00]原文\n[00:02.00]second");
+        for i in 0..lyrics.lines.len() {
+            assert_eq!(
+                lyrics.aux_text_for(i, app.lyric_translation, app.lyric_roman),
+                None,
+                "第 {i} 行不该有辅助行"
+            );
+        }
     }
 
     #[test]
@@ -10333,8 +11470,16 @@ mod tests {
 
         let rec_seq = app.rec_peek.as_ref().unwrap().seq;
         let chart_seq = app.chart_peek.as_ref().unwrap().seq;
-        assert_eq!(app.peek_seq_match(rec_seq), Some(PeekPanel::Rec));
-        assert_eq!(app.peek_seq_match(chart_seq), Some(PeekPanel::Chart));
+        assert_eq!(
+            app.peek_seq_match(rec_seq),
+            Some((PeekPanel::Rec, false)),
+            "首屏 seq 归 Rec 面板"
+        );
+        assert_eq!(
+            app.peek_seq_match(chart_seq),
+            Some((PeekPanel::Chart, false)),
+            "首屏 seq 归 Chart 面板"
+        );
         assert_eq!(
             app.peek_seq_match(chart_seq + 1000),
             None,

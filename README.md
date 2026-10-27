@@ -1,5 +1,7 @@
 # Reimu Player 基于rsut构建的音乐播放器
 
+![Reimu Player 主界面](img/player_font22.png)
+
 **System 6 × Y2K 磁带机美学桌面音乐播放器** —— Rust + egui 自绘界面，把本地音乐文件与网易云在线曲库统一装进同一盘磁带里。本项目本质为wishcoding产物使用mimo2.6rpo+deepseekV4 1017制作，有bug我尽量修复。
 
 > **English.** Reimu Player is a desktop music player written in pure Rust (eframe/egui, self-drawn UI).

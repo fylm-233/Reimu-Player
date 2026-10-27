@@ -237,33 +237,7 @@ pub fn show(
                                 enabled,
                                 danger,
                             } => {
-                                let (rect, resp) = ui
-                                    .allocate_exact_size(Vec2::new(MENU_W, ITEM_H), Sense::click());
-                                let hot = *enabled && resp.hovered();
-                                if hot {
-                                    ui.painter().rect_filled(rect, radius_none(), pal().blue);
-                                }
-                                let color = if !*enabled {
-                                    widgets::with_opacity(pal().mid, 0.55)
-                                } else if hot {
-                                    fg_on(pal().blue)
-                                } else if *danger {
-                                    pal().error_mark
-                                } else {
-                                    pal().ink
-                                };
-                                widgets::paint_spec_text(
-                                    ui,
-                                    pos2_left(rect, PAD_X),
-                                    Align2::LEFT_CENTER,
-                                    label,
-                                    FONT_TINY,
-                                    TRACKING_TINY,
-                                    color,
-                                    false,
-                                    true,
-                                );
-                                if hot && resp.clicked() {
+                                if item_row(ui, label, *enabled, *danger) {
                                     chosen = Some(action.clone());
                                 }
                             }
@@ -295,6 +269,42 @@ pub fn show(
 /// 行内左对齐基准点。
 fn pos2_left(rect: Rect, dx: f32) -> Pos2 {
     eframe::egui::pos2(rect.min.x + dx, rect.center().y)
+}
+
+/// 画一行可点菜单条目，返回「本帧被点了」。
+///
+/// 单独抽出来是因为文本输入框的「粘贴」菜单
+/// （[`super::clipboard::attach_paste_menu`]）要用**同一份**绘制代码：
+/// 两处外观一旦分叉，用户会看到两种菜单。
+///
+/// `enabled = false` 时既不高亮也不可点（灰显）；`danger` 只影响常态文字色。
+pub(crate) fn item_row(ui: &mut Ui, label: &str, enabled: bool, danger: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(MENU_W, ITEM_H), Sense::click());
+    let hot = enabled && resp.hovered();
+    if hot {
+        ui.painter().rect_filled(rect, radius_none(), pal().blue);
+    }
+    let color = if !enabled {
+        widgets::with_opacity(pal().mid, 0.55)
+    } else if hot {
+        fg_on(pal().blue)
+    } else if danger {
+        pal().error_mark
+    } else {
+        pal().ink
+    };
+    widgets::paint_spec_text(
+        ui,
+        pos2_left(rect, PAD_X),
+        Align2::LEFT_CENTER,
+        label,
+        FONT_TINY,
+        TRACKING_TINY,
+        color,
+        false,
+        true,
+    );
+    hot && resp.clicked()
 }
 
 /// 给「加入歌单」这一组生成条目（多处共用，避免文案与顺序漂移）。
