@@ -1,4 +1,4 @@
-# Reimu Player
+# Reimu Player 基于rsut构建的音乐播放器
 
 **System 6 × Y2K 磁带机美学桌面音乐播放器** —— Rust + egui 自绘界面，把本地音乐文件与网易云在线曲库统一装进同一盘磁带里。本项目本质为wishcoding产物使用mimo2.6rpo+deepseekV4 1017制作
 
@@ -423,6 +423,7 @@ Font Awesome 的署名要求由 `LICENSE-FontAwesome.txt` 覆盖，再分发时�
   （`playmode_intelligence_list`）与本地歌曲匹配（`search_match`）接入的权威依据。
 - **`egui` / `eframe`**（emilk 及贡献者）—— 即时模式 GUI，让整窗自绘不必背一套 Web 运行时。
 - **Rodio**、**Lofty** —— Rust 音频与元数据生态。
+- 感谢@Nekori347 提供的mimo2.6订阅plan key，这几乎构建了整个底座部分
 - 「Reimu」与「东风谷早苗 / 博丽灵梦 / 雾雨魔理沙」等主题名取自《东方 Project》，
   系上海爱丽丝幻乐团的既有作品角色，仅作配色命名致敬，与原作无关联。
 
