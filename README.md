@@ -1,6 +1,6 @@
 # Reimu Player
 
-**System 6 × Y2K 磁带机美学桌面音乐播放器** —— Rust + egui 自绘界面，把本地音乐文件与网易云在线曲库统一装进同一盘磁带里。
+**System 6 × Y2K 磁带机美学桌面音乐播放器** —— Rust + egui 自绘界面，把本地音乐文件与网易云在线曲库统一装进同一盘磁带里。本项目本质为wishcoding产物使用mimo2.6rpo+deepseekV4 1017制作
 
 > **English.** Reimu Player is a desktop music player written in pure Rust (eframe/egui, self-drawn UI).
 > It plays local audio files and NetEase Cloud Music (网易云) tracks through one queue, with real-time FFT
@@ -93,12 +93,12 @@ Reimu Player 是一个**单机桌面播放器**，不是任何音乐服务的官
 专辑与歌手曲目、分享链接解析（歌曲 / 歌单 / 专辑）。
 
 音质上限四档可选（128 kbps / 192 kbps / 320 kbps / 无损，默认无损）。
-**不做任何 VIP 权限、付费内容或地区版权限制的绕过** —— 不可播就如实报不可播。
+**不做任何 VIP 权限、付费内容或地区版权限制的绕过** —— 本项目仅供于学习与参考。
 
 ---
 
 ## 安装与构建
-
+-Releases里可下载已经打包好的EXE文件（仅Windows）
 ### 环境要求
 
 - Rust 工具链在 **1.95** 上开发验证；未声明 MSRV（`edition = "2021"`）。
