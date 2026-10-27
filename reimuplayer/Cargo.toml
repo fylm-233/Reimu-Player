@@ -1,0 +1,171 @@
+# 播放器本体。依赖选择依据 NETEASE_INTEGRATION_SPEC.md 第 5 节：
+# 按职责引入、只开需要的特性、记录许可证与体积影响。
+
+[package]
+name = "reimuplayer"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "System 6.x 风格音乐播放器核心（媒体加载 / 播放控制 / 进度与状态管理）"
+
+[lib]
+name = "reimuplayer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "reimuplayer"
+path = "src/main.rs"
+
+# GUI 测试程序（阶段 E）：验证在线搜索 / 歌曲详情 / 歌单读取的
+# 加载状态展示、超时控制与友好错误提示。仅在 --features gui 时编译。
+[[bin]]
+name = "gui-test"
+path = "src/bin/gui_test.rs"
+required-features = ["gui"]
+
+# Reimu Player 产品程序（正式产品化 UI）：同一套界面代码的产品入口，
+# 含自绘窗口边框（窗口管理）、图标字库、本地曲库扫描、推荐页与设置。
+[[bin]]
+name = "reimu-player"
+path = "src/bin/reimu-player.rs"
+required-features = ["gui"]
+
+[build-dependencies]
+# winresource 0.1  MIT OR Apache-2.0
+# 用途：把 ../assets/icon/reimu-player.ico 与版本信息写进 PE 资源段。
+# 这是资源管理器 / 桌面 / 快捷方式 / 开始菜单 / 任务栏（运行中与已固定）
+# 的图标来源；运行中窗口的图标也从同一份资源按系统尺寸取（gui::set_window_icon）。
+winresource = "0.1"
+
+[features]
+default = []
+# GUI 测试程序（Reimu Player 窗口）。不影响核心库：不启用时零额外依赖。
+gui = ["dep:eframe", "dep:rfd", "dep:qrcode", "dep:image"]
+
+[dependencies]
+# ---- 音频播放（解码 + 输出）----
+# rodio 0.23.0  MIT OR Apache-2.0
+# 关闭默认特性，仅启用播放与实际需要的格式（DESIGN_SPEC 15.4「按需启用」）。
+rodio = { version = "0.23", default-features = false, features = [
+    "playback",
+    "mp3",
+    "flac",
+    "wav",
+    "vorbis",
+    # 让 rodio 的诊断信息走 tracing，而不是直接写 stderr
+    "tracing",
+] }
+
+# ---- 媒体元数据（标题/艺人/专辑/时长）----
+# lofty 0.25.4  MIT OR Apache-2.0
+lofty = "0.25"
+
+# ---- 错误类型 ----
+thiserror = "2"
+
+# ---- 日志 ----
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ---- 阶段 B：网易云 Provider ----
+# ncm-api-rs 0.1.0  WTFPL
+ncm-api-rs = "=0.1.0"
+serde_json = "1"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    # 阶段 C：在线音频流式写盘（tokio::fs / AsyncWriteExt）
+    "fs",
+    "io-util",
+    # 阶段 F：桥取消机制（tokio::sync::watch）
+    "sync",
+] }
+
+# ---- 本地曲目指纹（`search_match` 的 `md5` 参数）----
+# md-5 0.10  MIT OR Apache-2.0（RustCrypto）
+# 依赖树既有（ncm-api-rs 已用它做 eapi 签名），提到直接依赖**不新增编译单元**。
+# 用途：算本地音频文件的 MD5。网易云用 `persistId`（即文件 MD5）作为
+# 「本地歌曲匹配」流程的入口，实测传空串一律返回空结果。
+md-5 = "0.10"
+
+# ---- 阶段 C：在线音频下载 ----
+# reqwest 0.12  MIT OR Apache-2.0
+# 依赖树既有（ncm-api-rs 已启用 rustls-tls/json/cookies/socks，特性合并、无新编译单元）。
+# 用途：AudioFetcher 的 HTTP 实现，chunk() 流式写盘，不整段进内存。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# ---- 阶段 E：GUI 测试程序（可选，仅 `--features gui`）----
+# eframe 0.37  MIT OR Apache-2.0（egui 之上的桌面壳，winit 窗口 + glow 渲染）。
+# 用途：gui-test 二进制——Reimu Player 窗口 UI 视觉规范（设计2.md）的验证载体，
+# 展示在线搜索 / 歌曲详情 / 歌单读取的加载状态、超时控制与错误提示。
+# 关闭默认特性仅留 glow 渲染与默认字体；体积影响只作用于 gui-test 二进制。
+eframe = { version = "0.37", optional = true, default-features = false, features = [
+    "glow",
+    "default_fonts",
+] }
+
+# ---- 产品 UI：封面图解码 ----
+# image 0.25  MIT OR Apache-2.0
+# 依赖树既有（eframe → image，特性合并、无新编译单元），此处显式声明以直接使用。
+# 用途：把网易云封面（JPEG/PNG）解码并缩到 96×96，再做点阵 halftone。
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+], optional = true }
+
+# ---- 产品 UI：二维码登录 ----
+# qrcode 0.14  MIT OR Apache-2.0
+# 用途：把网易云返回的二维码内容（一个 https 链接）编码成点阵，UI 直接画方块。
+# 为什么不用第三方图片服务：二维码内容属于登录凭据的一部分，不能外发。
+# 关闭默认特性后不拉 image/unicode 渲染，只保留编码器（约 40 KB）。
+qrcode = { version = "0.14", default-features = false, optional = true }
+
+# ---- 产品 UI：本地曲库文件夹选择（可选，仅 `--features gui`）----
+# rfd 0.15  MIT —— 跨平台原生目录选择对话框（Windows 用 IFileDialog，
+# macOS NSOpenPanel，Linux xdg-desktop-portal）。用途：本地播放列表
+# 「指定文件夹扫描」的目录入口。体积影响只作用于 gui 二进制。
+rfd = { version = "0.15", optional = true }
+
+# ---- 全局媒体键（仅 Windows）----
+# windows-sys 0.59  MIT OR Apache-2.0
+# 依赖树既有（winit → windows-sys 0.59），特性合并后**不新增编译单元**。
+# 用途：RegisterHotKey 注册播放/暂停、上一首、下一首、停止；独立线程跑
+# GetMessageW 消息循环收取 WM_HOTKEY（hwnd = NULL，不需要主窗口句柄）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    # 窗口图标：GetModuleHandleW 取当前模块的图标组资源（gui::set_window_icon）
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    # 任务栏身份：SetCurrentProcessExplicitAppUserModelID（产品入口调用）
+    "Win32_UI_Shell",
+    # 桌面歌词悬浮窗：分层 + 逐像素 alpha（DwmEnableBlurBehindWindow）
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    # 每日推荐：GetLocalTime 取本地日历日（判断"今天"是哪天、跨天自动刷新）
+    "Win32_System_SystemInformation",
+] }
+
+# ---- 窗口图标：从 CreationContext 取 HWND（仅 Windows）----
+# raw-window-handle 0.6.2  MIT OR Apache-2.0
+# 依赖树既有（winit → raw-window-handle），提到直接依赖**不新增编译单元**。
+# 用途：HasWindowHandle 取窗口句柄，再 WM_SETICON 写入 PE 资源里的多尺寸图标。
+raw-window-handle = "0.6"
+
+# ---- 托盘图标（仅 Windows）----
+# tray-icon 0.26.1  MIT OR Apache-2.0（Tauri 官方维护）
+# 用途：托盘图标 + 原生右键菜单（上一首/下一首/收藏/退出），默认关闭。
+# 关闭默认特性：默认特性只有 Linux 的 libappindicator，Windows 用不上。
+# 体积影响：仅 reimu-player 二进制；托盘图标与窗口/资源管理器同源
+# （assets/icon/tray.png，由 tools/icon_package.ps1 生成）。
+tray-icon = { version = "0.26", default-features = false }
+
+# ---- 系统媒体传输控件 SMTC（仅 Windows）----
+# smtc-player 0.1.0  MIT
+# 用途：向系统登记媒体会话——媒体浮层/锁屏/蓝牙耳机显示曲目并回传播放控制。
+# 为什么不用「自己调 ISystemMediaTransportControlsInterop」：那条路要窗口句柄，
+# 而 eframe 不暴露 winit 的 Window；本 crate 以 MediaPlayer 作宿主，无需 HWND。
+smtc-player = "0.1"

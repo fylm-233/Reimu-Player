@@ -1,0 +1,26 @@
+# reimuplayer —— System 6.x 风格音乐播放器
+#
+# 工作区成员：
+#   - reimuplayer  播放器本体（库 + CLI 验证入口）
+#
+# 统一 Release 配置：opt-level=z、lto、codegen-units=1、strip、panic=abort。
+
+[workspace]
+members = ["reimuplayer"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+repository = "https://github.com/local/reimuplayer"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+# 验证期需要能看懂 backtrace，保留调试符号
+debug = 1
