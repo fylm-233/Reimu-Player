@@ -312,7 +312,15 @@ pub fn procedural_cover(seed: u64, width: usize, height: usize) -> Vec<u8> {
 /// UI 层只负责把返回值上传为纹理。
 pub fn halftone_cover_bytes(bytes: &[u8], size: usize) -> Option<Vec<u8>> {
     let size = size.max(8);
-    let img = image::load_from_memory(bytes).ok()?;
+    // 压缩体积无法约束解码后的分配：先限制像素尺寸及解码预算。
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format().ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(32 * 1024 * 1024);
+    reader.limits(limits);
+    let img = reader.decode().ok()?;
     // 先居中裁成正方形，再缩放：直接 resize 会把封面拉变形
     let (w, h) = (img.width(), img.height());
     let side = w.min(h);

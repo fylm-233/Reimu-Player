@@ -72,12 +72,13 @@ mod platform {
     use super::{command_for_id, ids, TrayCommand};
     use crate::i18n::{pick, Lang};
     use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-    use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+    use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent, MouseButton};
 
     /// 托盘图标（持有即存在；`Drop` 会移除图标）。
     pub struct Tray {
         /// 图标本体。字段不读也要留着——它一被 drop 图标就消失。
         _icon: TrayIcon,
+        commands: std::sync::mpsc::Receiver<TrayCommand>,
         /// 播放/暂停那一项：文案随播放状态变（"播放" ↔ "暂停"）。
         play_item: MenuItem,
         /// 收藏那一项：文案随收藏状态变。
@@ -94,7 +95,7 @@ mod platform {
         /// 创建托盘图标与菜单。
         ///
         /// 失败（极少：通常是 Explorer 未就绪）返回 `Err`，调用方只提示一次。
-        pub fn new(lang: Lang, playing: bool, favorited: bool) -> Result<Self, String> {
+        pub fn new(lang: Lang, playing: bool, favorited: bool, ctx: eframe::egui::Context) -> Result<Self, String> {
             let menu = Menu::new();
             let play_item = MenuItem::with_id(
                 ids::PLAY_PAUSE,
@@ -132,8 +133,28 @@ mod platform {
                 .build()
                 .map_err(|e| e.to_string())?;
 
+            let (tx, commands) = std::sync::mpsc::channel();
+            let menu_tx = tx.clone();
+            let menu_ctx = ctx.clone();
+            MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+                if let Some(command) = command_for_id(event.id.0.as_str()) {
+                    let _ = menu_tx.send(command);
+                    menu_ctx.request_repaint(); // 隐藏时只唤醒 App::logic。
+                }
+            }));
+            let tray_id = tray.id().clone();
+            TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+                if let TrayIconEvent::DoubleClick { id, button: MouseButton::Left, .. } = event {
+                    if id == tray_id {
+                        let _ = tx.send(TrayCommand::Show);
+                        ctx.request_repaint();
+                    }
+                }
+            }));
+
             Ok(Self {
                 _icon: tray,
+                commands,
                 play_item,
                 fav_item,
                 lang,
@@ -174,12 +195,15 @@ mod platform {
         /// 取走这一帧的菜单命令（非阻塞）。
         pub fn poll(&self) -> Vec<TrayCommand> {
             let mut out = Vec::new();
-            while let Ok(event) = MenuEvent::receiver().try_recv() {
-                if let Some(cmd) = command_for_id(event.id.0.as_str()) {
-                    out.push(cmd);
-                }
-            }
+            while let Ok(command) = self.commands.try_recv() { out.push(command); }
             out
+        }
+    }
+
+    impl Drop for Tray {
+        fn drop(&mut self) {
+            MenuEvent::set_event_handler(None::<fn(MenuEvent)>);
+            TrayIconEvent::set_event_handler(None::<fn(TrayIconEvent)>);
         }
     }
 
@@ -209,7 +233,7 @@ mod platform {
 
     impl Tray {
         /// 恒失败：非 Windows 没有托盘后端。
-        pub fn new(_lang: Lang, _playing: bool, _favorited: bool) -> Result<Self, String> {
+        pub fn new(_lang: Lang, _playing: bool, _favorited: bool, _ctx: eframe::egui::Context) -> Result<Self, String> {
             Err("tray icon is only implemented on Windows".to_string())
         }
 

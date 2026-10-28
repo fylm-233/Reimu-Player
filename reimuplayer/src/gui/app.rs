@@ -156,6 +156,9 @@ const COVER_PX: usize = halftone::COVER_PX;
 /// 交错闪烁」。512 张 × 36KB ≈ 18MB 显存，覆盖现有全部列表（歌单 263、
 /// 搜索 50）还留了余量。
 const COVER_CACHE_LIMIT: usize = 512;
+/// 占位图按固定种子池共享，避免每首歌永久留下一个纹理。
+const PLACEHOLDER_VARIANTS: u64 = 32;
+const KNOWN_TRACK_LIMIT: usize = 4096;
 
 /// 封面在途请求上限——刻意低于封面池总槽位（4 道 × 每道 16 = 64）。
 ///
@@ -596,6 +599,7 @@ pub struct ReimuApp {
     playlist_autoplay: bool,
     /// 当前歌单已取到的曲目数（= 下一次续取的 `offset`）。
     playlist_offset: u32,
+    playlist_prefetch_at: f32,
     /// 当前歌单是否还有未取曲目（按接口 `total` 判断）。
     playlist_has_more: bool,
     /// 在途续取的 seq；`0` = 没有在途续取。
@@ -679,6 +683,8 @@ pub struct ReimuApp {
     cover_inflight: HashMap<String, u64>,
     /// 拉取/解码失败的 URL（不再重试，回退程序化封面）。
     cover_failed: std::collections::HashSet<String>,
+    cover_failure_epoch: std::time::Instant,
+    frame_clock: std::time::Instant,
 
     // ---- 列表/选中 ----
     selected: Option<usize>,
@@ -885,6 +891,7 @@ pub struct ReimuApp {
     hidden_to_tray: bool,
     /// 托盘要求退出（在 `update` 末尾统一发 Close，避免在轮询中途拆自己）。
     quit_requested: bool,
+    cache_cleanup: Option<std::sync::mpsc::Receiver<super::cache_cleanup::Report>>,
 
     // ---- SMTC（与媒体键同一个开关）----
     smtc: Option<super::smtc::Smtc>,
@@ -1021,6 +1028,7 @@ impl ReimuApp {
             playlist_jump: false,
             playlist_autoplay: false,
             playlist_offset: 0,
+            playlist_prefetch_at: 0.0,
             playlist_has_more: false,
             playlist_more_seq: 0,
             playlist_more_auto: false,
@@ -1057,6 +1065,8 @@ impl ReimuApp {
             cover_clock: 0,
             cover_inflight: HashMap::new(),
             cover_failed: std::collections::HashSet::new(),
+            cover_failure_epoch: std::time::Instant::now(),
+            frame_clock: std::time::Instant::now(),
             selected: if library_has_tracks { Some(0) } else { None },
             queue: Vec::new(),
             queue_active: false,
@@ -1136,6 +1146,7 @@ impl ReimuApp {
             tray_warned: false,
             hidden_to_tray: false,
             quit_requested: false,
+            cache_cleanup: None,
             smtc: None,
             smtc_warned: false,
             ctx: None,
@@ -1195,6 +1206,7 @@ impl ReimuApp {
             .map_err(|e| tracing::warn!("音频输出设备不可用: {}", e))
             .ok();
         let mut app = Self::assemble(bridge, PlayerCore::new(engine), library::load());
+        app.ctx = Some(cc.egui_ctx.clone());
         // 开机装带（HTML boot()：开舱→装带→落座→合舱→咔哒→toast）
         app.deck_seq.start_boot();
         // 恢复偏好：音质上限 + 界面语言（默认档/默认语言 = 旧行为，无回退风险）
@@ -2226,15 +2238,16 @@ impl ReimuApp {
     /// [`Self::install_cover`] 统一上传。这样预缓存既不阻塞本帧，也不产生
     /// 用不到的程序化占位纹理。
     fn prefetch_cover(&mut self, url: &str) {
-        if self.cover_tex.contains_key(url)
-            || self.cover_inflight.contains_key(url)
-            || self.cover_failed.contains(url)
+        let key = super::bridge::cover_cache_key(url);
+        if self.cover_tex.contains_key(&key)
+            || self.cover_inflight.contains_key(&key)
+            || self.cover_failed.contains(&key)
             || self.cover_inflight.len() >= COVER_INFLIGHT_LIMIT
         {
             return;
         }
         let seq = self.bridge.cover_image(url);
-        self.cover_inflight.insert(url.to_string(), seq);
+        self.cover_inflight.insert(key, seq);
     }
 
     /// 当前曲开始播放后，预取「实际下一首」的**音频**、歌词与封面。
@@ -2307,7 +2320,9 @@ impl ReimuApp {
     // ------------------------------------------------------------------
 
     fn drain_responses(&mut self, ctx: &egui::Context) {
-        while let Some(response) = self.bridge.poll() {
+        // 避免封面批量完成时一次耗尽整个 UI 帧；剩余响应留给后续帧。
+        for _ in 0..32 {
+            let Some(response) = self.bridge.poll() else { break; };
             // 即将交给引擎的那份文件要"钉住"：缓存淘汰与半成品清扫不得删它。
             // 不能指望 Windows 拒绝删除——`RodioEngine::reload()` 是按路径重开的，
             // 目录项一消失，下一次 play/seek 就 MediaRead 失败。
@@ -2513,7 +2528,8 @@ impl ReimuApp {
                                 existing.total = page_total.or(existing.total);
                                 // 队列正好是这张歌单的前 `before` 首 → 一起延长。
                                 // 不同步的话"列表 100 首、队列 50 首"，播到 50 就停。
-                                if self.queue_active && self.queue.len() == before {
+                                if self.queue_active && self.queue.len() == before
+                                    && self.queue.iter().zip(existing.tracks.iter()).all(|(a, b)| a.id == b.id && a.provider == b.provider) {
                                     self.queue.extend(existing.tracks[before..].iter().cloned());
                                 }
                                 // 本页一条都没进来（整页详情都解析失败）就停止续取，
@@ -2824,6 +2840,7 @@ impl ReimuApp {
                     }
                 }
                 Response::CoverImage { url, result, .. } => {
+                    let url = super::bridge::cover_cache_key(&url);
                     self.cover_inflight.remove(&url);
                     match result {
                         // 已经是烘好的 RGBA（解码 + 网纹在后台线程完成）
@@ -4313,7 +4330,7 @@ impl ReimuApp {
             .as_ref()
             .map(|t| self.favorites.contains(t))
             .unwrap_or(false);
-        match super::tray::Tray::new(self.lang, self.core.is_playing(), favorited) {
+        match super::tray::Tray::new(self.lang, self.core.is_playing(), favorited, self.ctx.clone().unwrap_or_default()) {
             Ok(tray) => {
                 tracing::info!("托盘图标已创建");
                 self.tray = Some(tray);
@@ -4531,8 +4548,50 @@ impl ReimuApp {
     }
 
     /// 程序化封面（无真实 `cover_url` 时的兜底，也用作真实封面到达前的占位）。
+    fn trim_runtime_caches(&mut self) {
+        // 暂时性网络失败五分钟后允许重试，不把一次失败判为会话永久失败。
+        if self.cover_failure_epoch.elapsed() >= Duration::from_secs(300) {
+            self.cover_failed.clear();
+            self.cover_failure_epoch = std::time::Instant::now();
+        }
+        if self.cover_failed.len() > 2048 {
+            let remove: Vec<String> = self.cover_failed.iter()
+                .take(self.cover_failed.len() - 2048).cloned().collect();
+            for url in remove { self.cover_failed.remove(&url); }
+        }
+        // 已有列表/播放队列自己持有完整 Track，索引只保留当前业务引用及
+        // 一部分历史条目；不扫描或修改用户的收藏、歌单和历史文件。
+        if self.known.len() > KNOWN_TRACK_LIMIT && self.cover_clock % 128 == 0 {
+            let mut protected: std::collections::HashSet<String> = self
+                .current_tracks().iter().chain(self.queue.iter())
+                .map(|track| track.id.clone()).collect();
+            if let Some(now) = self.core.now_playing() {
+                protected.insert(now.id.clone());
+            }
+            let remove: Vec<String> = self.known.keys()
+                .filter(|id| !protected.contains(*id))
+                .take(self.known.len().saturating_sub(KNOWN_TRACK_LIMIT))
+                .cloned().collect();
+            for id in remove {
+                self.known.remove(&id);
+            }
+        }
+        // 安装阶段为了避免淘汰本帧资源可以暂时超限，独立收缩冷资源。
+        while self.cover_tex.len() > COVER_CACHE_LIMIT {
+            let current = self.core.now_playing().and_then(|now| now.cover_url.as_deref())
+                .map(super::bridge::cover_cache_key);
+            let victim = self.cover_tex.iter()
+                .filter(|(url, entry)| Some(url.as_str()) != current.as_deref()
+                    && self.cover_clock.wrapping_sub(entry.used) > 1)
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(url, _)| url.clone());
+            let Some(victim) = victim else { break; };
+            self.cover_tex.remove(&victim);
+        }
+    }
+
     fn cover_texture(&mut self, ctx: &egui::Context, seed_src: &str) -> Option<TextureId> {
-        let seed = widgets::hash_id(seed_src);
+        let seed = widgets::hash_id(seed_src) % PLACEHOLDER_VARIANTS;
         let handle = self.covers.entry(seed).or_insert_with(|| {
             let rgba = halftone::procedural_cover(seed, COVER_PX, COVER_PX);
             let image = egui::ColorImage::from_rgba_unmultiplied([COVER_PX, COVER_PX], &rgba);
@@ -4561,7 +4620,8 @@ impl ReimuApp {
         let Some(url) = url.filter(|u| !u.is_empty()) else {
             return self.cover_texture(ctx, fallback_key);
         };
-        if let Some(entry) = self.cover_tex.get_mut(url) {
+        let key = super::bridge::cover_cache_key(url);
+        if let Some(entry) = self.cover_tex.get_mut(&key) {
             entry.used = self.cover_clock;
             return Some(entry.tex.id());
         }
@@ -4571,9 +4631,9 @@ impl ReimuApp {
         if self.cover_inflight.len() >= COVER_INFLIGHT_LIMIT {
             return self.cover_texture(ctx, fallback_key);
         }
-        if !self.cover_failed.contains(url) && !self.cover_inflight.contains_key(url) {
+        if !self.cover_failed.contains(&key) && !self.cover_inflight.contains_key(&key) {
             let seq = self.bridge.cover_image(url);
-            self.cover_inflight.insert(url.to_string(), seq);
+            self.cover_inflight.insert(key, seq);
         }
         self.cover_texture(ctx, fallback_key)
     }
@@ -4603,10 +4663,13 @@ impl ReimuApp {
         // 「淘汰 → 重拉 → 淘汰」的自激循环。找不到可淘汰的旧条目时宁可不淘汰
         // （缓存暂时超出上限），也不要动正在显示的封面。
         if !self.cover_tex.contains_key(&url) && self.cover_tex.len() >= COVER_CACHE_LIMIT {
+            let current = self.core.now_playing().and_then(|now| now.cover_url.as_deref())
+                .map(super::bridge::cover_cache_key);
             let victim = self
                 .cover_tex
                 .iter()
-                .filter(|(_, cached)| cached.used != self.cover_clock)
+                .filter(|(key, cached)| cached.used != self.cover_clock
+                    && Some(key.as_str()) != current.as_deref())
                 .min_by_key(|(_, cached)| cached.used)
                 .map(|(victim, _)| victim.clone());
             if let Some(victim) = victim {
@@ -6586,35 +6649,12 @@ impl ReimuApp {
                 self.push_toast(msg);
             }
             SettingsAction::SweepTempFiles => {
-                // 用户手动触发：只清异常退出留下的旧目录，本进程与 1 小时内
-                // 还在写的目录都不动（判据在 sweep_stale_scratch 内部）。
-                let report = crate::music::online_playback::sweep_stale_scratch();
-                let freed = if report.bytes_freed >= 1024 * 1024 {
-                    format!("{:.1} MB", report.bytes_freed as f64 / (1024.0 * 1024.0))
-                } else if report.bytes_freed >= 1024 {
-                    format!("{:.1} KB", report.bytes_freed as f64 / 1024.0)
+                if self.cache_cleanup.is_none() {
+                    self.cache_cleanup = Some(super::cache_cleanup::start());
+                    self.push_toast(self.t("正在清扫歌单、封面及播放残留…", "CLEANING PLAYLIST, COVER AND STALE AUDIO CACHES…"));
                 } else {
-                    format!("{} B", report.bytes_freed)
-                };
-                let msg = match (self.lang, report.dirs_removed, report.dirs_failed) {
-                    (Lang::Zh, 0, 0) => "临时文件清扫：没有可清理的残留".to_string(),
-                    (Lang::En, 0, 0) => "Temp sweep: nothing stale to clean".to_string(),
-                    (Lang::Zh, dirs, 0) => format!(
-                        "临时文件清扫：删除 {dirs} 个目录 / {} 个文件，释放 {freed}",
-                        report.files_removed
-                    ),
-                    (Lang::En, dirs, 0) => format!(
-                        "Temp sweep: removed {dirs} dirs / {} files, freed {freed}",
-                        report.files_removed
-                    ),
-                    (Lang::Zh, dirs, failed) => format!(
-                        "临时文件清扫：删除 {dirs} 个目录，释放 {freed}；{failed} 个目录未能删除",
-                    ),
-                    (Lang::En, dirs, failed) => format!(
-                        "Temp sweep: removed {dirs} dirs, freed {freed}; {failed} could not be deleted"
-                    ),
-                };
-                self.push_toast(msg);
+                    self.push_toast(self.t("清扫正在进行中…", "CLEANUP IN PROGRESS…"));
+                }
             }
         }
     }
@@ -6692,7 +6732,8 @@ impl ReimuApp {
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.search_input)
                         .hint_text(hint)
-                        .desired_width(ui.available_width() - 190.0),
+                        .font(egui::FontId::new(15.0, egui::FontFamily::Proportional))
+                        .desired_width((ui.available_width() - 190.0).max(80.0)),
                 );
                 // Ctrl+V 走 `inject_paste`；右键菜单这条路 egui 不自带，得自己挂
                 super::clipboard::attach_paste_menu(
@@ -7108,6 +7149,12 @@ impl ReimuApp {
     /// 视觉沿用专辑/艺人页那一套：页头左侧固定标题、右上「← 返回」，
     /// 下面一行副标题写歌单名，再往下是磁带架同款曲目 spine。
     fn ui_playlist_peek(&mut self, ui: &mut Ui, panel: PeekPanel) -> PeekHit {
+        ui.push_id(("playlist-peek", panel.scroll_salt()), |ui| {
+            self.ui_playlist_peek_content(ui, panel)
+        }).inner
+    }
+
+    fn ui_playlist_peek_content(&mut self, ui: &mut Ui, panel: PeekPanel) -> PeekHit {
         let Some(peek) = self.peek(panel) else {
             return PeekHit::None;
         };
@@ -7117,7 +7164,7 @@ impl ReimuApp {
             self.t("Playlist Tracks / 歌单曲目", "Playlist Tracks"),
             self.t("← 返回", "← BACK"),
         ) {
-            hit = PeekHit::Back;
+            return PeekHit::Back;
         }
         let sub = widgets::fit_text(
             ui,
@@ -7664,45 +7711,26 @@ impl ReimuApp {
             // 播放入口与「重载」分列两端：左边是"拿这批去听"，右边是"重新拉一批"，
             // 语义不同不该挤在一起。
             let mut daily_play: Option<bool> = None;
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+                ui.set_min_height(38.0);
                 widgets::load_badge(ui, &badge_text, badge_color);
-                ui.add_space(10.0);
                 if let Some(shuffle) = self.daily_play_row(ui, tracks.is_empty()) {
                     daily_play = Some(shuffle);
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if widgets::text_button(
-                        ui,
-                        ui.scope_id().with("btn-daily-reload"),
-                        self.t("重载", "RELOAD"),
-                        true,
-                        false,
-                    )
-                    .clicked()
-                    {
-                        self.refresh_daily();
-                    }
-                });
+                if widgets::text_button(ui, ui.scope_id().with("btn-daily-reload"),
+                    self.t("重载", "RELOAD"), true, false).clicked() {
+                    self.refresh_daily();
+                }
             });
-            if let Some(shuffle) = daily_play {
-                self.play_daily_all(shuffle);
-            }
-            // 日期行：既回答"这是哪一天的推荐"，也是跨天自动刷新的可见证据
-            widgets::paint_spec_text(
-                ui,
-                ui.cursor().min,
-                Align2::LEFT_TOP,
-                self.t(
-                    &format!("{day} · 服务端按账号每天生成"),
-                    &format!("{day} · GENERATED DAILY FOR THIS ACCOUNT"),
-                ),
-                FONT_TINY,
-                TRACKING_TINY,
-                pal().mid,
-                false,
-                true,
-            );
-            ui.add_space(20.0);
+            if let Some(shuffle) = daily_play { self.play_daily_all(shuffle); }
+            ui.add_space(8.0);
+            let date = self.t(
+                &format!("{day} · 服务端按账号每天生成"),
+                &format!("{day} · GENERATED DAILY FOR THIS ACCOUNT"),
+            ).to_owned();
+            ui.label(widgets::wrap_to(widgets::spec_job(&date, 12.0, 0.02, pal().mid, false), ui.available_width(), 2));
+            ui.add_space(12.0);
 
             if tracks.is_empty() {
                 // 加载中不插兜底内容：否则会先闪一段离线列表、再被在线结果顶掉
@@ -7854,7 +7882,7 @@ impl ReimuApp {
                     ),
                 ] {
                     ui.label(widgets::wrap_to(
-                        widgets::spec_job(line, 10.0, 0.01, pal().ink, false),
+                        widgets::spec_job(line, 12.0, 0.01, pal().ink, false),
                         ui.available_width(),
                         3,
                     ));
@@ -8694,9 +8722,9 @@ impl ReimuApp {
                         let label = if self.sync.active() {
                             self.t("同步中…", "SYNCING…")
                         } else {
-                            self.t("↻ 同步收藏", "↻ SYNC LIKED")
+                            self.t("同步收藏", "SYNC LIKED")
                         };
-                        if widgets::text_button(
+                        if widgets::sync_text_button(
                             ui,
                             ui.scope_id().with("btn-sync-liked"),
                             label,
@@ -9098,6 +9126,68 @@ impl ReimuApp {
 }
 
 impl eframe::App for ReimuApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ctx = Some(ctx.clone());
+        let now = std::time::Instant::now();
+        self.t += now.duration_since(self.frame_clock).as_secs_f32();
+        self.frame_clock = now;
+        self.cover_clock = self.cover_clock.wrapping_add(1);
+        let scope = match self.login.state.as_ref() {
+            Some(LoginState::LoggedIn { user_id: Some(id), .. }) => Some(id.as_str()),
+            _ => None,
+        };
+        self.bridge.set_playlist_cache_scope(scope);
+        self.drain_responses(ctx);
+        if let Some(result) = self.cache_cleanup.as_ref().map(|rx| rx.try_recv()) {
+            match result {
+                Ok(report) => {
+                    self.cache_cleanup = None;
+                    self.cover_failed.clear();
+                    let size = report.bytes as f64 / (1024.0 * 1024.0);
+                    self.push_toast(self.t(
+                        &format!("清扫完成：{} 个文件，释放 {size:.2} MiB，{} 项失败", report.files, report.failed),
+                        &format!("CLEANED {} FILES / {size:.2} MiB / {} FAILED", report.files, report.failed),
+                    ));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.cache_cleanup = None;
+                    self.push_toast(self.t("清扫未能完成，请稍后重试", "CLEANUP COULD NOT COMPLETE; TRY AGAIN"));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
+        self.tick_login_poll();
+        self.tick_daily_rollover();
+        self.extend_heartbeat();
+        // 每次只续一页，间隔至少 750ms；与浏览位置无关，播放时也能延长队列。
+        if self.t >= self.playlist_prefetch_at && !self.playlist_state.is_loading()
+            && self.playlist_has_more && self.playlist_more_seq == 0 {
+            self.playlist_prefetch_at = self.t + 0.75;
+            self.load_more_playlist(true);
+        }
+        if self.core.tick() == TickAction::TrackEnded { self.auto_next(); }
+        self.poll_media_keys();
+        self.poll_smtc();
+        self.poll_tray();
+        self.tick_history();
+        self.update_lyric_focus();
+        self.trim_runtime_caches();
+        if self.quit_requested {
+            self.quit_requested = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if self.hidden_to_tray || ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
+            // 仅歌词开启时允许隐藏父窗口声明子视口，其余情况没有 UI pass。
+            if self.desktop_lyric.enabled() && self.desktop_lyric.has_sink() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+            }
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+
     /// 全透明清屏。
     ///
     /// eframe 用**同一个** `clear_color` 清每个视口的 framebuffer，而桌面歌词是
@@ -9111,6 +9201,11 @@ impl eframe::App for ReimuApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.hidden_to_tray || ui.input(|i| i.viewport().minimized.unwrap_or(false)) {
+            self.push_desktop_lyric();
+            return;
+        }
+
         // 粘贴：eframe 没启用 `clipboard` feature（不引入 arboard，见
         // `gui::clipboard`），egui-winit 因此从不产生 `Event::Paste`，
         // 所有 `TextEdit` 的 Ctrl+V 都拿不到东西。这里自己读一次系统剪贴板，
@@ -9129,8 +9224,6 @@ impl eframe::App for ReimuApp {
 
         let dt = ui.input(|i| i.stable_dt).min(0.1);
         perf_log::sample(dt);
-        self.t += dt;
-        self.cover_clock = self.cover_clock.wrapping_add(1);
 
         // 原始输入取证（trace 级，默认关闭零成本）。排查"控件在没人操作时自己
         // 触发"这类问题，先看这里有没有真实事件进来：egui 的 `clicked()` 只能由
@@ -9179,20 +9272,6 @@ impl eframe::App for ReimuApp {
         }
 
         let ctx = ui.ctx().clone();
-        // 托盘命令、设置动作都要在没有 `&mut Ui` 的地方发视口命令，先把上下文存下
-        self.ctx = Some(ctx.clone());
-        self.drain_responses(&ctx);
-        self.tick_login_poll();
-        // 每日推荐的跨天检查：每帧一次整数比较，跨天后自动换成当天数据
-        self.tick_daily_rollover();
-        // 心动模式续批检查：每帧几次整数比较，队列快见底才发一次请求
-        self.extend_heartbeat();
-        if self.core.tick() == TickAction::TrackEnded {
-            self.auto_next();
-        }
-        self.poll_media_keys();
-        self.poll_smtc();
-        self.poll_tray();
         self.handle_shortcuts(&ctx);
         // 视觉校对探针：右键菜单画在 Foreground 层，是否被裁剪只能看像素
         #[cfg(debug_assertions)]
@@ -9235,9 +9314,8 @@ impl eframe::App for ReimuApp {
                 self.set_page(Page::Rec);
             }
         }
-        self.tick_history();
-        self.update_lyric_focus();
         self.push_desktop_lyric();
+
         self.animate_deck(dt);
 
         // 边缘缩放热区（6px 边带，8 向）：贴 viewport 最外缘，最先命中
@@ -9328,9 +9406,6 @@ impl eframe::App for ReimuApp {
         // SMTC 按钮事件、媒体键都是**通道轮询**——不重绘就收不到，表现为
         // 「收进托盘后右键菜单点了没反应」「耳机上的播放键要等鼠标动一下才生效」。
         // 这里在后台态按 4Hz 要帧：足够跟手，也不至于空转耗电。
-        if self.hidden_to_tray || ui.input(|i| i.viewport().focused == Some(false)) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
-        }
         // 视觉校对探针：仅在设置了 REIMU_PROBE_PAGE 时生效（生产路径无副作用）
         if let Some((target, page)) = super::probe::requested_page() {
             if !super::probe::free_nav() && self.page != page {

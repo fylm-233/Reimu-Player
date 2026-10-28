@@ -24,6 +24,7 @@ pub mod app;
 pub mod bridge;
 pub mod click_through;
 pub mod clipboard;
+mod cache_cleanup;
 pub mod context_menu;
 pub mod daily_clock;
 pub mod deck_seq;
@@ -42,6 +43,7 @@ pub mod lyric_window;
 pub mod media_keys;
 pub mod perf_log;
 pub mod persist;
+mod playlist_cache;
 pub mod player_core;
 pub mod prefs;
 pub mod probe;
@@ -101,6 +103,7 @@ pub fn run_with_library(
     library_dir: Option<String>,
 ) -> eframe::Result {
     let options = eframe::NativeOptions {
+        system_font_fallback: true,
         viewport: eframe::egui::ViewportBuilder::default()
             .with_decorations(false) // 自绘边框/标题栏（gui::window）
             .with_inner_size([1100.0, 860.0]) // 设计稿 1100px 基准（GUI_ALIGNMENT_PLAN §5.5）

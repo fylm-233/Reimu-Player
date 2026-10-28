@@ -1,0 +1,13 @@
+This software uses MiSans Latin fonts.
+Copyright © 2020-2024  Beijing Xiaomi Mobile Software Co.,Ltd. All Rights Reserved.
+
+Original, unmodified static faces: Regular, Bold, Heavy.
+Source archive: MiSans_Latin.zip supplied by the user.
+MiSans fonts are licensed under Xiaomi's MiSans Font Intellectual Property License Agreement, not SIL OFL.
+The original agreement accompanies this software as LICENSE-MiSans.pdf.
+Official source: https://hyperos.mi.com/font/
+
+本软件使用 MiSans Latin 字体，版权归小米所有。
+所用 Regular、Bold、Heavy 为原版字体，未经裁剪或修改。
+完整许可协议随软件附于 LICENSE-MiSans.pdf。
+本 Latin 字体包不能替代中日韩及其他文字系统的专用字体。

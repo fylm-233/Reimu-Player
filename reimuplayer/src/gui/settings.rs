@@ -210,6 +210,12 @@ fn lang_row(ui: &mut Ui, view: &SettingsView) -> Option<Lang> {
                 picked = Some(*lang);
             }
         }
+        ui.add_space(8.0);
+        ui.label(widgets::spec_job(
+            "MiSans Latin", FONT_TINY, 0.0, pal().mid, false,
+        ))
+        .on_hover_text(include_str!("../../assets/fonts/NOTICE-MiSans.txt"));
+
     });
     picked
 }
@@ -520,7 +526,7 @@ fn temp_files_row(ui: &mut Ui, view: &SettingsView) -> bool {
     row(
         ui,
         SALT_TEMP_FILES,
-        pick(view.lang, "临时文件", "TEMP FILES"),
+        pick(view.lang, "缓存清扫", "CACHE CLEAN"),
         |ui| {
             if widgets::tiny_button(
                 ui,
@@ -530,8 +536,8 @@ fn temp_files_row(ui: &mut Ui, view: &SettingsView) -> bool {
             )
             .on_hover_text(pick(
                 view.lang,
-                "删除非本进程、超过 1 小时未写入的播放缓存目录",
-                "REMOVE PLAYBACK CACHE DIRS >1H OLD (OTHER PROCESSES)",
+                "清理歌单与封面磁盘缓存，以及超过 1 小时的其他进程播放残留；保留收藏、历史、登录和当前播放",
+                "CLEAR PLAYLIST/COVER DISK CACHES AND STALE AUDIO; KEEP USER DATA AND CURRENT PLAYBACK",
             ))
             .clicked()
             {
@@ -539,7 +545,7 @@ fn temp_files_row(ui: &mut Ui, view: &SettingsView) -> bool {
             }
             ui.add_space(8.0);
             ui.label(widgets::spec_job(
-                pick(view.lang, "异常退出的播放缓存", "STALE PLAYBACK CACHE"),
+                pick(view.lang, "歌单、封面与播放残留", "PLAYLIST / COVER / STALE AUDIO"),
                 FONT_TINY,
                 TRACKING_TINY,
                 pal().mid,

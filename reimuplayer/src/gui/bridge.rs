@@ -88,6 +88,7 @@ pub enum Request {
         /// 请求序列号。
         seq: u64,
         playlist_id: String,
+        cache_scope: Option<String>,
         offset: u32,
         limit: u32,
     },
@@ -491,6 +492,7 @@ pub struct ProviderBridge {
     /// 存在的唯一理由：**同步、无网络**的设置类调用（音质上限）不必排进
     /// 请求队列——那要占一个 seq、等一次回执，而它只是往原子量里写一个字节。
     provider: Arc<dyn DynMusicProvider>,
+    playlist_cache_scope: Option<String>,
 }
 
 impl ProviderBridge {
@@ -574,6 +576,7 @@ impl ProviderBridge {
             cover_next: 0,
             cover_stop,
             provider,
+            playlist_cache_scope: None,
         }
     }
 
@@ -616,11 +619,18 @@ impl ProviderBridge {
     }
 
     /// 分配序列号并发送歌单分页请求，返回序列号。
+    pub fn set_playlist_cache_scope(&mut self, user_id: Option<&str>) {
+        if self.playlist_cache_scope.as_deref() != user_id {
+            self.playlist_cache_scope = user_id.map(str::to_owned);
+        }
+    }
+
     pub fn playlist(&mut self, playlist_id: impl Into<String>, offset: u32, limit: u32) -> u64 {
         let seq = self.next_seq();
         self.send(Request::Playlist {
             seq,
             playlist_id: playlist_id.into(),
+            cache_scope: self.playlist_cache_scope.clone(),
             offset,
             limit,
         });
@@ -1206,19 +1216,29 @@ async fn execute(provider: &Arc<dyn DynMusicProvider>, request: Request) -> Resp
             })
             .await,
         },
-        Request::Playlist {
-            seq,
-            playlist_id,
-            offset,
-            limit,
-        } => Response::Playlist {
-            seq,
-            result: with_retry(|| {
+        Request::Playlist { seq, playlist_id, cache_scope, offset, limit } => {
+            if let Some(scope) = cache_scope.as_deref() {
+                if let Some(page) = super::playlist_cache::read(scope, &playlist_id, offset, limit, false) {
+                    return Response::Playlist { seq, result: Ok(page) };
+                }
+            }
+            let mut result = with_retry(|| {
                 let provider = Arc::clone(provider);
                 let playlist_id = playlist_id.clone();
                 async move { provider.playlist(&playlist_id, offset, limit).await }
-            })
-            .await,
+            }).await;
+            if let Some(scope) = cache_scope.as_deref() {
+                match &result {
+                    Ok(page) => super::playlist_cache::write(scope, page, offset, limit),
+                    Err(ProviderError::NetworkUnavailable | ProviderError::RequestTimeout | ProviderError::ConnectionReset) => {
+                        if let Some(page) = super::playlist_cache::read(scope, &playlist_id, offset, limit, true) {
+                            result = Ok(page);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Response::Playlist { seq, result }
         },
         Request::Featured { seq, kind, limit } => Response::Featured {
             seq,
@@ -1525,7 +1545,26 @@ fn cover_cache_dir() -> Option<std::path::PathBuf> {
 /// URL → 缓存文件名（64 位哈希的十六进制）。
 fn cover_cache_path(url: &str) -> Option<std::path::PathBuf> {
     let dir = cover_cache_dir()?;
-    Some(dir.join(format!("{:016x}.bin", super::widgets::hash_id(url))))
+    Some(dir.join(format!("{:016x}.bin", super::widgets::hash_id(&cover_cache_key(url)))))
+}
+
+/// 仅规范化网易云图片身份；原始 URL 仍用于请求，保留其他查询参数语义。
+pub(super) fn cover_cache_key(url: &str) -> String {
+    let Ok(parsed) = reqwest::Url::parse(url) else { return url.to_owned(); };
+    let host = parsed.host_str().unwrap_or_default();
+    if host != "music.126.net" && !host.ends_with(".music.126.net") {
+        return url.to_owned();
+    }
+    let mut key = format!("ncm-cover-v1:{}", parsed.path());
+    let mut query = parsed.query_pairs()
+        .filter(|(name, _)| name != "param")
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    query.sort();
+    for (name, value) in query {
+        key.push_str(&format!("|{}:{}:{}:{}", name.len(), name, value.len(), value));
+    }
+    key
 }
 
 /// 读磁盘缓存；长度不对（半截文件 / 尺寸改过）一律当没有。
@@ -1660,12 +1699,18 @@ async fn fetch_cover_bytes(url: &str) -> Result<Vec<u8>, ProviderError> {
             response.status()
         )));
     }
-    let bytes = response.bytes().await.map_err(|e| classify_reqwest(&e))?;
-    if bytes.len() > MAX_COVER_BYTES {
-        tracing::warn!("封面过大（{} B），放弃", bytes.len());
+    let mut response = response;
+    if response.content_length().is_some_and(|len| len > MAX_COVER_BYTES as u64) {
         return Err(ProviderError::UnsupportedResponse);
     }
-    Ok(bytes.to_vec())
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| classify_reqwest(&e))? {
+        if chunk.len() > MAX_COVER_BYTES.saturating_sub(bytes.len()) {
+            return Err(ProviderError::UnsupportedResponse);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// 便捷：为只测桥逻辑的调用方提供「无下载器」的桩。

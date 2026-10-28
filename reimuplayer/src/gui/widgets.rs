@@ -36,11 +36,11 @@ pub fn tracking_px(tracking_em: f32, size: f32) -> f32 {
 /// 真实字面（见 [`super::theme::setup_fonts`]），中文有 700 面可用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Weight {
-    /// 常规（Inter 400 → Noto SC 400）。
+    /// 常规（MiSans Latin Regular → Inter 400 → Noto SC 400）。
     Regular,
-    /// 粗体（Inter 700 → Noto SC 700）。
+    /// 粗体（MiSans Latin Bold → Inter 700 → Noto SC 700）。
     Bold,
-    /// 标题级（Inter 900 → Noto SC 700 + 双描补到 ≈900）。
+    /// 标题级（MiSans Latin Heavy → Inter 900 → Noto SC 700）。
     Black,
 }
 
@@ -1134,10 +1134,44 @@ pub fn text_button(
     primary: bool,
     toggled: bool,
 ) -> Response {
+    text_button_job(ui, id, spec_job(text, FONT_LABEL, TRACKING_LABEL,
+        fg_on(if primary { pal().acid } else { pal().panel }), false), primary, toggled)
+}
+
+/// 图标和正文分段排版，图标不会依赖正文或系统字体的符号覆盖。
+pub fn icon_text_button(ui: &mut Ui, id: egui::Id, icon: &str, text: &str,
+    primary: bool, toggled: bool) -> Response {
+    let color = fg_on(if primary { pal().acid } else { pal().panel });
+    let mut job = spec_job(icon, FONT_LABEL, 0.0, color, false);
+    let label = spec_job(text, FONT_LABEL, TRACKING_LABEL, color, false);
+    let offset = job.text.len();
+    job.text.push_str(&label.text);
+    for mut section in label.sections {
+        section.byte_range = (section.byte_range.start + offset)..(section.byte_range.end + offset);
+        if section.byte_range.start == eframe::egui::text::ByteIndex(offset) { section.leading_space += 6.0; }
+        job.sections.push(section);
+    }
+    text_button_job(ui, id, job, primary, toggled)
+}
+
+/// 同步箭头使用矢量线条，完全不依赖正文、图标或系统字体的覆盖。
+pub fn sync_text_button(ui: &mut Ui, id: egui::Id, text: &str,
+    primary: bool, toggled: bool) -> Response {
+    let color = fg_on(if primary { pal().acid } else { pal().panel });
+    let job = spec_job(text, FONT_LABEL, TRACKING_LABEL, color, false);
+    text_button_job_impl(ui, id, job, primary, toggled, true)
+}
+
+fn text_button_job(ui: &mut Ui, id: egui::Id, job: LayoutJob,
+    primary: bool, toggled: bool) -> Response {
+    text_button_job_impl(ui, id, job, primary, toggled, false)
+}
+
+fn text_button_job_impl(ui: &mut Ui, id: egui::Id, job: LayoutJob,
+    primary: bool, toggled: bool, sync_icon: bool) -> Response {
     let fill = if primary { pal().acid } else { pal().panel };
-    let job = spec_job(text, FONT_LABEL, TRACKING_LABEL, fg_on(fill), false);
     let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
-    let size = vec2(galley.size().x + 22.0, 34.0);
+    let size = vec2(galley.size().x + 22.0 + if sync_icon { 20.0 } else { 0.0 }, 34.0);
     let (rect, _) = ui.allocate_exact_size(size, Sense::click());
     let response = ui.interact(rect, id, Sense::click());
     let pressed = response.is_pointer_button_down_on() || toggled;
@@ -1154,11 +1188,73 @@ pub fn text_button(
         StrokeKind::Inside,
     );
     painter.galley(
-        rect.center() - galley.size() / 2.0,
+        rect.center() - galley.size() / 2.0 + vec2(if sync_icon { 10.0 } else { 0.0 }, 0.0),
         galley,
         Color32::TRANSPARENT,
     );
+    if sync_icon {
+        let texture = sync_icon_texture(ui.ctx());
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let center = pos2(
+            ((rect.min.x + 16.0) * pixels_per_point).round() / pixels_per_point,
+            (rect.center().y * pixels_per_point).round() / pixels_per_point,
+        );
+        painter.image(texture.id(), Rect::from_center_size(center, vec2(16.0, 16.0)),
+            Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), fg_on(fill));
+    }
     response
+}
+
+/// Supersampled monochrome mask, cached once per egui context. Image filtering
+/// smooths only this icon even when the application's geometry feathering is off.
+fn sync_icon_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let id = egui::Id::new("reimu-sync-icon-smooth-v1");
+    if let Some(texture) = ctx.data_mut(|data| data.get_temp::<egui::TextureHandle>(id)) {
+        return texture;
+    }
+    const SIDE: usize = 96;
+    const SAMPLES: usize = 2;
+    let radius = 5.0_f32;
+    let span = 2.42_f32;
+    let starts = [-1.27_f32, -1.27 + std::f32::consts::PI];
+    let cross = |a: Vec2, b: Vec2| a.x * b.y - a.y * b.x;
+    let contains = |p: Vec2| -> bool {
+        starts.iter().any(|&start| {
+            let end = start + span;
+            let first = vec2(start.cos(), start.sin()) * radius;
+            let last = vec2(end.cos(), end.sin()) * radius;
+            let delta = (p.y.atan2(p.x) - start).rem_euclid(std::f32::consts::TAU);
+            let distance = if delta <= span { (p.length() - radius).abs() }
+                else { (p - first).length().min((p - last).length()) };
+            let tangent = vec2(-end.sin(), end.cos());
+            let normal = vec2(end.cos(), end.sin());
+            // Slim, identical arrowheads, joined to a uniform 1.5-point arc.
+            let a = last + tangent * 1.4;
+            let b = last - tangent * 1.7 + normal * 1.65;
+            let c = last - tangent * 1.7 - normal * 1.65;
+            let edges = [cross(b - a, p - a), cross(c - b, p - b), cross(a - c, p - c)];
+            let in_arrow = edges.iter().all(|&v| v >= 0.0) || edges.iter().all(|&v| v <= 0.0);
+            distance <= 0.75 || in_arrow
+        })
+    };
+    let mut pixels = Vec::with_capacity(SIDE * SIDE);
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            let mut covered = 0;
+            for sy in 0..SAMPLES {
+                for sx in 0..SAMPLES {
+                    let px = (x as f32 + (sx as f32 + 0.5) / SAMPLES as f32) * 16.0 / SIDE as f32 - 8.0;
+                    let py = (y as f32 + (sy as f32 + 0.5) / SAMPLES as f32) * 16.0 / SIDE as f32 - 8.0;
+                    covered += usize::from(contains(vec2(px, py)));
+                }
+            }
+            pixels.push(Color32::from_white_alpha((covered * 255 / (SAMPLES * SAMPLES)) as u8));
+        }
+    }
+    let texture = ctx.load_texture("reimu-sync-icon-smooth",
+        egui::ColorImage::new([SIDE, SIDE], pixels), egui::TextureOptions::LINEAR);
+    ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
+    texture
 }
 
 // ---------------------------------------------------------------------------
@@ -2528,12 +2624,12 @@ pub fn res_row(ui: &mut Ui, id: egui::Id, view: &ResRow) -> RowAction {
     );
     let title_x = rect.min.x + 28.0 + gap;
     let title_job = if view.highlight.trim().is_empty() {
-        spec_job(view.title, 10.5, 0.01, fg, true)
+        spec_job(view.title, 13.0, 0.01, fg, false)
     } else {
         highlight_job(
             view.title,
             view.highlight,
-            10.5,
+            13.0,
             0.01,
             fg,
             if view.current {
@@ -2541,7 +2637,7 @@ pub fn res_row(ui: &mut Ui, id: egui::Id, view: &ResRow) -> RowAction {
             } else {
                 with_opacity(pal().blue, 0.18)
             },
-            true,
+            false,
         )
     };
     let title_job = truncate_to(title_job, (fr - gap).max(24.0));
@@ -2556,8 +2652,8 @@ pub fn res_row(ui: &mut Ui, id: egui::Id, view: &ResRow) -> RowAction {
     let artist_job = truncate_to(
         spec_job(
             view.artist,
-            FONT_TINY,
-            0.08,
+            12.0,
+            0.01,
             if view.current {
                 with_opacity(fg_on(pal().blue), 0.7)
             } else if hovered {
@@ -2565,7 +2661,7 @@ pub fn res_row(ui: &mut Ui, id: egui::Id, view: &ResRow) -> RowAction {
             } else {
                 with_opacity(pal().ink, 0.7)
             },
-            true,
+            false,
         ),
         (fr - gap).max(24.0),
     );
@@ -2601,7 +2697,7 @@ pub fn res_row(ui: &mut Ui, id: egui::Id, view: &ResRow) -> RowAction {
         fav_rect.center(),
         Align2::CENTER_CENTER,
         super::icons::HEART,
-        12.0,
+        14.0,
         0.0,
         if view.favorite {
             if view.current {
@@ -2627,7 +2723,7 @@ pub fn res_row(ui: &mut Ui, id: egui::Id, view: &ResRow) -> RowAction {
         play_rect.center(),
         Align2::CENTER_CENTER,
         "▶",
-        11.0,
+        12.0,
         0.0,
         fg,
         false,
@@ -2808,7 +2904,7 @@ pub fn hot_row(ui: &mut Ui, id: egui::Id, view: &HotRow) -> RowAction {
 
     let title_x = rect.min.x + cols.title_x;
     let title_job = truncate_to(
-        spec_job(view.title, 10.5, 0.01, fg, true),
+        spec_job(view.title, 13.0, 0.01, fg, false),
         (cols.title_w - gap).max(24.0),
     );
     paint_job(
@@ -2822,8 +2918,8 @@ pub fn hot_row(ui: &mut Ui, id: egui::Id, view: &HotRow) -> RowAction {
     let artist_job = truncate_to(
         spec_job(
             view.artist,
-            FONT_TINY,
-            0.08,
+            12.0,
+            0.01,
             if view.current {
                 with_opacity(fg_on(pal().blue), 0.7)
             } else if hovered {
@@ -2892,7 +2988,7 @@ pub fn hot_row(ui: &mut Ui, id: egui::Id, view: &HotRow) -> RowAction {
         play_rect.center(),
         Align2::CENTER_CENTER,
         if view.loading { "…" } else { "▶" },
-        11.0,
+        12.0,
         0.0,
         if view.loading {
             with_opacity(fg, 0.5)
@@ -3099,7 +3195,7 @@ pub fn playlist_card(
             del_rect.center(),
             Align2::CENTER_CENTER,
             super::icons::CLOSE,
-            11.0,
+            12.0,
             0.0,
             pal().error_mark,
             false,
@@ -3221,14 +3317,15 @@ pub fn deck_at(ui: &Ui, rect: Rect, view: &DeckView) {
         StrokeKind::Inside,
     );
 
-    // 卡带（装带动画：insert 0→1 落座，透明度 .22→1；落座时 seat 轻震）
+    // 卡带：屏幕 Y 轴向下，insert 0→1 时从下方上移到舱内中心。
+    // 退带反向沿同一路径下移；透明度、行程、时长及落座轻震保持原值。
     let insert = view.insert.clamp(0.0, 1.0);
     if insert > 0.0 {
-        let lift = (1.0 - insert) * rect.height() * 0.10;
+        let entry_dy = (1.0 - insert) * rect.height() * 0.10;
         // 0.90 而不是 0.96：舱盖改成透明玻璃后，磁带与舱壁之间必须留出一圈
         // 可见的玻璃边（含描边），否则玻璃会被磁带完全盖住、看不出是"盖板"。
         let cass_rect = Rect::from_center_size(
-            rect.center() + vec2(0.0, -lift + view.seat_dy),
+            rect.center() + vec2(0.0, entry_dy + view.seat_dy),
             vec2(
                 rect.width() * CASSETTE_FILL,
                 rect.width() * CASSETTE_FILL / CASSETTE_RATIO,

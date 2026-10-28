@@ -683,66 +683,35 @@ pub fn apply_global_style(ctx: &egui::Context) {
     ctx.tessellation_options_mut(|o| o.feathering = false);
 }
 
-/// 装配字体（产品化：内嵌开源字库，不依赖系统字体）。
+/// 内嵌 MiSans Latin 原版静态字体，保留 Inter 与 Noto 的缺字回退。
 ///
-/// ## 为什么是这套组合（本轮字体统一的核心结论）
+/// 正文：MiSans Latin Regular → Inter 400 → Noto SC 400 → Noto JP 400。
+/// 粗体：MiSans Latin Bold → Inter 700 → Noto SC 700 → Noto JP 700。
+/// 标题：MiSans Latin Heavy → Inter 900 → Noto SC 700 → Noto JP 700。
+/// 等宽数字继续使用 Hack；缺字先交给 MiSans Latin，再走其余后备。
+/// 字重是界面语义档，不把原字体的 OS/2 字重值强改成 400/700/900。
 ///
-/// 旧方案是「Inter 四个字重 + Noto Sans SC **只有一个 400**」，而
-/// [`widgets::spec_job`] 从来只用 `Proportional` 字族，**加粗全靠双描**。
-/// 于是同一行「HI-FI 已就绪」里，拉丁是 Inter 400 双描、中文是 Noto SC 400
-/// 双描——中文笔画密度本来就高，0.45px 的固定偏移在 9px 处把中文糊成一团，
-/// 在 24px 处又几乎看不出加粗，中英观感必然分裂。
-///
-/// 现在的组合：
-/// - **Inter**（SIL OFL 1.1）400/700/900——拉丁 UI 字形，中性无衬线，贴合
-///   设计稿的 Helvetica/Geneva 栈；
-/// - **Noto Sans SC**（SIL OFL 1.1）**400/700 两个真实字重**——简体中文；
-/// - **Font Awesome 6 Free Solid**（SIL OFL 1.1）——图标字库（见 [`icons`]）。
-///
-/// 关键变化是「中文有了真实 700 面」：中英在同一字重档上不再一个真粗、
-/// 一个假粗。900 档（24px 曲目标题）用 `Inter 900 + Noto SC 700 + 双描`，
-/// 双描偏移随字号缩放（[`widgets::paint_job`]），中文落到 ≈900 的观感。
-///
-/// ## 字族映射
-///
-/// - `Proportional` = Inter 400 → Noto SC 400 → Noto JP 400（常规）
-/// - `ui-bold` = Inter 700 → Noto SC 700 → Noto JP 700（真粗，[`font_family_bold`]）
-/// - `ui-black` = Inter 900 → Noto SC 700 → Noto JP 700（标题级，[`font_family_black`]）
-/// - `Monospace` = 默认 Hack → Noto SC 400 → Noto JP 400（数字 tabular）
-///
-/// ## 为什么是三张面
-///
-/// 三面覆盖范围**互补**，顺序即优先级：
-///
-/// 1. **Inter** —— 拉丁 / 希腊 / 西里尔（含 Latin Ext-A/B）。拉丁字形归拉丁面，
-///    这也是排版正确性的要求。
-/// 2. **Noto Sans SC** —— 简体汉字（GB2312）与 UI 符号。
-/// 3. **Noto Sans JP** —— 日文新字体汉字（時/楽/図/駅/円…）与日文标点。
-///
-/// 缺任何一面都会出方块：GB2312 不含日文新字体，而 Google Fonts 的 Noto Sans SC
-/// **根本没有**这些码位（无 slice 覆盖 U+6642），所以只能同族补一张 JP。
-///
-/// ## 体积
-///
-/// 全部按需子集化（`tools/fonts/build_*.py`，均为 OFL 1.1，明确允许裁剪）：
-/// Inter 三面各 ≈150 KB、SC 两面各 ≈2.3 MB、JP 两面各 ≈1.15 MB。
-/// JP 只带 SC 缺失的码位（≈3.3k），因此只有 SC 的一半。
-/// 改完字库务必跑 `python tools/fonts/verify_coverage.py` —— 缺字是**静默**的。
+/// MiSans 文件直接来自用户提供的 MiSans_Latin.zip，未裁剪或修改。
+/// 版权与许可见 assets/fonts/NOTICE-MiSans.txt、LICENSE-MiSans.pdf。
+/// Latin 包不覆盖韩文、泰文、阿拉伯文等，不能当作全球文字字体包。
 pub fn setup_fonts(ctx: &egui::Context) {
     let mut defs = FontDefinitions::default();
 
     let embedded: &[(&str, &[u8])] = &[
+        ("latin-fallback-regular", include_bytes!("../../assets/fonts/Inter_400Regular.ttf")),
+        ("latin-fallback-bold", include_bytes!("../../assets/fonts/Inter_700Bold.ttf")),
+        ("latin-fallback-black", include_bytes!("../../assets/fonts/Inter_900Black.ttf")),
         (
             "ui-regular",
-            include_bytes!("../../assets/fonts/Inter_400Regular.ttf"),
+            include_bytes!("../../assets/fonts/MiSansLatin-Regular.ttf"),
         ),
         (
             "ui-bold",
-            include_bytes!("../../assets/fonts/Inter_700Bold.ttf"),
+            include_bytes!("../../assets/fonts/MiSansLatin-Bold.ttf"),
         ),
         (
             "ui-black",
-            include_bytes!("../../assets/fonts/Inter_900Black.ttf"),
+            include_bytes!("../../assets/fonts/MiSansLatin-Heavy.ttf"),
         ),
         (
             "cjk-regular",
@@ -778,10 +747,11 @@ pub fn setup_fonts(ctx: &egui::Context) {
     // 误引用会在 set_fonts 后首次布局时 panic；
     // 常用符号由 cjk-regular（Noto Sans SC）兜底。
     //
-    // 顺序即优先级：拉丁/希腊/西里尔走 Inter → 简体汉字与符号走 SC →
+    // 顺序即优先级：MiSans Latin → Inter 补充 → 简体汉字与符号走 SC →
     // 日文新字体汉字走 JP。三面覆盖范围互补，缺字才会落到最后一个。
     let proportional = vec![
         "ui-regular".to_owned(),
+        "latin-fallback-regular".to_owned(),
         "cjk-regular".to_owned(),
         "jp-regular".to_owned(),
     ];
@@ -789,19 +759,22 @@ pub fn setup_fonts(ctx: &egui::Context) {
 
     let mono = vec![
         "Hack".to_owned(),
+        "ui-regular".to_owned(),
+        "latin-fallback-regular".to_owned(),
         "cjk-regular".to_owned(),
         "jp-regular".to_owned(),
     ];
     defs.families.insert(FontFamily::Monospace, mono);
 
-    for (family, primary) in [
-        (font_family_bold(), "ui-bold"),
-        (font_family_black(), "ui-black"),
+    for (family, primary, fallback) in [
+        (font_family_bold(), "ui-bold", "latin-fallback-bold"),
+        (font_family_black(), "ui-black", "latin-fallback-black"),
     ] {
         // 真粗面在前；中文没有 900 面，黑色档同样落到 cjk-bold，
         // 再由 `paint_job` 的字号自适应双描补到 ≈900。
         let list = vec![
             primary.to_owned(),
+            fallback.to_owned(),
             "cjk-bold".to_owned(),
             "jp-bold".to_owned(),
         ];
