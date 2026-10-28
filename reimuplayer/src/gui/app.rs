@@ -784,6 +784,11 @@ pub struct ReimuApp {
     deck_seq: deck_seq::DeckSeq,
     /// 当前舱内磁带 ID（变更检测 → 换带时间线）。
     deck_tape_id: Option<String>,
+    // 舱内显示快照：开舱/退带保留旧曲目，进入装带阶段才交接新内容。
+    deck_display_now: Option<super::player_core::NowPlaying>,
+    deck_hold_content: bool,
+    deck_lyric_rows: Vec<(String, String, Option<String>)>,
+    deck_lyric_active: Option<usize>,
 
     // ---- 设置 ----
     /// 曲目信息面板底部的设置区是否展开（默认收起）。
@@ -1104,6 +1109,10 @@ impl ReimuApp {
             well_dy: 0.0,
             deck_seq: deck_seq::DeckSeq::default(),
             deck_tape_id: None,
+            deck_display_now: None,
+            deck_hold_content: false,
+            deck_lyric_rows: Vec::new(),
+            deck_lyric_active: None,
             settings_open: false,
             lang: Lang::default(),
             pref_lang: Lang::default(),
@@ -5250,6 +5259,11 @@ impl ReimuApp {
                 self.deck_seq.start_load(had_tape);
             }
         }
+        self.deck_hold_content = self.deck_display_now.is_some()
+            && matches!(self.deck_seq.stage(), deck_seq::DeckStage::Open | deck_seq::DeckStage::Eject);
+        if !self.deck_hold_content {
+            self.deck_display_now = self.core.now_playing().cloned();
+        }
         let frame = self.deck_seq.tick(dt);
         self.tray_open = frame.open;
         self.insert = frame.insert;
@@ -5552,7 +5566,7 @@ impl ReimuApp {
             ui,
             pos2(rect.max.x - 12.0, rect.min.y + 12.0),
             Align2::RIGHT_TOP,
-            if self.core.now_playing().map(|n| n.is_local).unwrap_or(false) {
+            if self.deck_display_now.as_ref().map(|n| n.is_local).unwrap_or(false) {
                 "SIDE A — LOCAL"
             } else {
                 "SIDE A — ONLINE"
@@ -5570,7 +5584,7 @@ impl ReimuApp {
             rect.center() + vec2(0.0, 6.0),
             vec2(deck_w, deck_w / widgets::CASSETTE_RATIO),
         );
-        let now = self.core.now_playing().cloned();
+        let now = self.deck_display_now.clone();
         let (cover, title, artist, spin) = match now {
             Some(now) => {
                 // 真实封面 → 点阵化；无 cover_url / 拉取失败 → 程序化点阵兜底
@@ -5603,7 +5617,7 @@ impl ReimuApp {
 
     /// 曲目信息（track-title 24/900 + 艺人 + HI-FI 徽标）。
     fn ui_track_info(&mut self, ui: &mut Ui) {
-        let (title, artist, tag) = match self.core.now_playing() {
+        let (title, artist, tag) = match self.deck_display_now.as_ref() {
             Some(now) => (
                 now.title.clone(),
                 if now.artist.is_empty() {
@@ -6051,7 +6065,9 @@ impl ReimuApp {
         // (时间戳, 原文, 辅助行)：辅助行按「译文优先、罗马音补位」算好，
         // 两个开关都关时恒 `None`——此时渲染结果与加这个功能之前完全一致。
         let rows_data: Vec<(String, String, Option<String>)> =
-            match self.core.session().lyrics() {
+            if self.deck_hold_content {
+                self.deck_lyric_rows.clone()
+            } else { match self.core.session().lyrics() {
                 Some(lyrics) => lyrics
                     .lines
                     .iter()
@@ -6075,7 +6091,15 @@ impl ReimuApp {
                     });
                     vec![(String::new(), fallback.clone(), None)]
                 }
-            };
+            }};
+        let active = if self.deck_hold_content {
+            self.deck_lyric_active
+        } else {
+            let active = self.core.active_lyric();
+            self.deck_lyric_rows.clone_from(&rows_data);
+            self.deck_lyric_active = active;
+            active
+        };
         let rows: Vec<LyricRow> = rows_data
             .iter()
             .map(|(t, x, aux)| LyricRow {
@@ -6089,11 +6113,11 @@ impl ReimuApp {
             self.lang,
             ui.scope_id().with("lyrics"),
             &rows,
-            self.core.active_lyric(),
-            self.lyric_focus,
+            active,
+            if self.deck_hold_content { None } else { self.lyric_focus },
             height,
         );
-        if let Some(i) = clicked {
+        if let Some(i) = clicked.filter(|_| !self.deck_hold_content) {
             if let Some(lyrics) = self.core.session().lyrics() {
                 if let Some(line) = lyrics.lines.get(i) {
                     let target = Duration::from_millis(line.start_ms);
